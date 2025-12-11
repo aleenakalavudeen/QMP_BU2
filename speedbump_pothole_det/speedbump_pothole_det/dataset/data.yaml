@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['Pothole detection']
+
+roboflow:
+  workspace: pothole-detector-u9ffd
+  project: pothole-detection-zgdgi
+  version: 7
+  license: CC BY 4.0
+  url: https://universe.roboflow.com/pothole-detector-u9ffd/pothole-detection-zgdgi/dataset/7

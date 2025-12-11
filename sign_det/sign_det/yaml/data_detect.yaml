@@ -1,0 +1,4 @@
+train: ../train_detection/images
+val: ../test_detection/images
+nc: 4
+names: ['prohibitory', 'danger', 'mandatory', 'other']
