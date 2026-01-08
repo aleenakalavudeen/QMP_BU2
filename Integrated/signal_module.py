@@ -1,5 +1,5 @@
 """
-Traffic Signal (Light) Detection Module
+Traffic Signal (Light) Detection Module (YOLOv5)
 
 This module wraps the YOLOv5 model for detecting traffic lights.
 The best performing model is YOLOv5, which detects and classifies:
