@@ -34,7 +34,7 @@ def test_pipeline():
         # Check output structure
         print("\n4. Verifying output structure...")
         
-        required_keys = ['detections', 'confidence_summaries', 'fused_feature_vector', 'annotated_frame']
+        required_keys = ['detections', 'confidence_summaries', 'annotated_frame']
         for key in required_keys:
             if key in results:
                 print(f"   ✓ '{key}' present")
@@ -47,7 +47,7 @@ def test_pipeline():
         if len(results['detections']) >= 0:  # Can be empty for dummy image
             sample_det = results['detections'][0] if results['detections'] else None
             if sample_det:
-                det_keys = ['model_type', 'class_name', 'confidence', 'bbox', 'feature_vector']
+                det_keys = ['model_type', 'class_name', 'confidence', 'bbox']
                 for key in det_keys:
                     if key in sample_det:
                         print(f"   ✓ Detection has '{key}'")
@@ -65,17 +65,8 @@ def test_pipeline():
                 print(f"   ✗ '{key}' missing!")
                 return False
         
-        # Check fused feature vector
-        print("\n7. Checking fused feature vector...")
-        fused = results['fused_feature_vector']
-        if isinstance(fused, np.ndarray) and len(fused) == 256:
-            print(f"   ✓ Fused vector: shape={fused.shape}, dtype={fused.dtype}")
-        else:
-            print(f"   ✗ Fused vector incorrect: shape={fused.shape if isinstance(fused, np.ndarray) else type(fused)}")
-            return False
-        
         # Check annotated frame
-        print("\n8. Checking annotated frame...")
+        print("\n7. Checking annotated frame...")
         annotated = results['annotated_frame']
         if isinstance(annotated, np.ndarray) and annotated.shape == test_image.shape:
             print(f"   ✓ Annotated frame: shape={annotated.shape}")

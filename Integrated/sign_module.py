@@ -14,6 +14,46 @@ import torch
 from ultralytics import YOLO
 from pathlib import Path
 import os
+import sys
+
+# Try to import YOLOv5 utilities from various possible locations
+DetectMultiBackend = None
+AutoShape = None
+select_device = None
+
+# Try to find and import from various YOLOv5 locations
+base_dir = Path(__file__).parent.parent
+possible_yolov5_paths = [
+    base_dir / 'signal_det' / 'signal_det',  # Check signal_det first (might have YOLOv5)
+    base_dir / 'yolov5-master',
+    base_dir / 'yolov5',
+    Path('../yolov5-master'),
+    Path('../signal_det/signal_det'),
+]
+
+_yolov5_path_used = None
+for yolov5_path in possible_yolov5_paths:
+    if yolov5_path.exists():
+        yolov5_path_str = str(yolov5_path.resolve())  # Use absolute path
+        
+        # Add YOLOv5 path first
+        if yolov5_path_str not in sys.path:
+            sys.path.insert(0, yolov5_path_str)
+        else:
+            # Move to front
+            sys.path.remove(yolov5_path_str)
+            sys.path.insert(0, yolov5_path_str)
+        
+        try:
+            from models.common import DetectMultiBackend, AutoShape
+            from utils.torch_utils import select_device
+            _yolov5_path_used = yolov5_path_str
+            print(f"  ✓ Found YOLOv5 at: {yolov5_path_str}")
+            break
+        except ImportError as e:
+            # Remove from path if import failed to avoid conflicts
+            if yolov5_path_str in sys.path:
+                sys.path.remove(yolov5_path_str)
 
 
 class SignDetector:
@@ -81,34 +121,111 @@ class SignDetector:
         print(f"Loading sign detection model from: {detect_weights_path}")
         print(f"Loading sign recognition model from: {recog_weights_path}")
         
-        # Load YOLOv5 detection model
-        # Try to find yolov5 repository path
-        if yolov5_repo_path is None:
-            # Try common locations
-            possible_paths = [
-                base_dir / 'yolov5-master',
-                base_dir / 'yolov5',
-                Path('../yolov5-master'),
-            ]
-            yolov5_repo_path = None
-            for path in possible_paths:
-                if os.path.exists(path):
-                    yolov5_repo_path = str(path)
-                    break
+        # Try loading YOLOv5 detection model using multiple methods
+        model_loaded = False
         
-        if yolov5_repo_path is None:
-            # Fallback: use ultralytics hub
-            print("Warning: Using ultralytics hub for yolov5: v6.2 (may download model)")
-            self.detect_model = torch.hub.load('ultralytics/yolov5: v6.2', 'custom', 
-                                               path=detect_weights_path, 
-                                               force_reload=True, 
-                                               source='github')
+        # Method 1: Try using DetectMultiBackend directly (most reliable, avoids torch.hub issues)
+        if not (DetectMultiBackend and AutoShape and select_device and _yolov5_path_used):
+            print(f"  ⚠ DetectMultiBackend not available (DetectMultiBackend={DetectMultiBackend is not None}, "
+                  f"AutoShape={AutoShape is not None}, select_device={select_device is not None}, "
+                  f"path={_yolov5_path_used})")
         else:
-            # Load from local repository
-            self.detect_model = torch.hub.load(yolov5_repo_path, 'custom', 
-                                               path=detect_weights_path, 
-                                               force_reload=True, 
-                                               source='local')
+            try:
+                print("  Loading YOLOv5 using DetectMultiBackend...")
+                # Ensure YOLOv5 path is first in sys.path
+                original_sys_path = sys.path.copy()
+                
+                if _yolov5_path_used in sys.path:
+                    sys.path.remove(_yolov5_path_used)
+                sys.path.insert(0, _yolov5_path_used)
+                
+                try:
+                    device_obj = select_device(device if device else '')
+                    # DetectMultiBackend will unpickle the model, which needs correct path
+                    model = DetectMultiBackend(detect_weights_path, device=device_obj, dnn=False, fp16=False)
+                    # Wrap with AutoShape for compatibility with torch.hub interface
+                    self.detect_model = AutoShape(model)
+                    self.detect_model.eval()
+                    model_loaded = True
+                    print("  ✓ Loaded using DetectMultiBackend")
+                finally:
+                    # Restore original sys.path
+                    sys.path[:] = original_sys_path
+                    # Re-add YOLOv5 path at position 0
+                    sys.path.insert(0, _yolov5_path_used)
+            except Exception as e:
+                print(f"  ⚠ DetectMultiBackend loading failed: {e}")
+                import traceback
+                traceback.print_exc()
+                print("  Trying fallback method...")
+        
+        # Method 2: Try using ultralytics/yolov5 from GitHub
+        if not model_loaded:
+            try:
+                print("  Loading YOLOv5 from ultralytics hub...")
+                # Temporarily ensure YOLOv5 path is first for unpickling
+                original_sys_path = sys.path.copy()
+                
+                if _yolov5_path_used and _yolov5_path_used not in sys.path:
+                    sys.path.insert(0, _yolov5_path_used)
+                elif _yolov5_path_used and _yolov5_path_used in sys.path:
+                    sys.path.remove(_yolov5_path_used)
+                    sys.path.insert(0, _yolov5_path_used)
+                
+                try:
+                    # Convert device to string format for torch.hub.load
+                    device_str = str(self.device) if isinstance(self.device, torch.device) else self.device
+                    self.detect_model = torch.hub.load('ultralytics/yolov5', 'custom', 
+                                                       path=detect_weights_path, 
+                                                       force_reload=True,  # Force reload to avoid cache issues
+                                                       source='github',
+                                                       device=device_str)
+                    self.detect_model.eval()
+                    model_loaded = True
+                    print("  ✓ Loaded using ultralytics/yolov5 hub")
+                finally:
+                    sys.path[:] = original_sys_path
+                    if _yolov5_path_used:
+                        sys.path.insert(0, _yolov5_path_used)
+            except Exception as e:
+                print(f"  ⚠ GitHub loading failed: {e}")
+                import traceback
+                traceback.print_exc()
+                print("  Trying ultralytics YOLO fallback...")
+        
+        # Method 3: Try ultralytics YOLO (can load YOLOv5 weights)
+        if not model_loaded:
+            try:
+                print("  Trying ultralytics YOLO as fallback...")
+                # Temporarily ensure YOLOv5 path is first for unpickling YOLOv5 weights
+                original_sys_path = sys.path.copy()
+                
+                if _yolov5_path_used and _yolov5_path_used not in sys.path:
+                    sys.path.insert(0, _yolov5_path_used)
+                elif _yolov5_path_used and _yolov5_path_used in sys.path:
+                    sys.path.remove(_yolov5_path_used)
+                    sys.path.insert(0, _yolov5_path_used)
+                
+                try:
+                    self.detect_model = YOLO(detect_weights_path)
+                    self.detect_model.eval()
+                    model_loaded = True
+                    print("  ✓ Loaded using ultralytics YOLO")
+                finally:
+                    sys.path[:] = original_sys_path
+                    if _yolov5_path_used:
+                        sys.path.insert(0, _yolov5_path_used)
+            except Exception as e:
+                print(f"  ⚠ ultralytics YOLO loading failed: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        if not model_loaded:
+            raise RuntimeError(
+                f"Failed to load YOLOv5 detection model from {detect_weights_path}. "
+                "Tried DetectMultiBackend, torch.hub, and ultralytics YOLO. "
+                "Please check that the weights file is valid."
+            )
         
         # Load YOLOv8 recognition model
         self.recog_model = YOLO(recog_weights_path)
@@ -134,22 +251,26 @@ class SignDetector:
     def _red_color_segmentation(self, image):
         """
         Apply red color segmentation to filter traffic signs.
+        This matches the original sign_det pipeline logic exactly.
         This helps improve detection accuracy by focusing on red-colored signs.
         
         Args:
             image (numpy.ndarray): BGR image
             
         Returns:
-            numpy.ndarray: Binary mask where red regions are white
+            numpy.ndarray: Gray mask where red regions are filtered by area
         """
         # Convert BGR to HSV color space (better for color-based segmentation)
         hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         
         # Define red color ranges in HSV
         # Red wraps around in HSV, so we need two ranges
-        lower1 = np.array([0, 120, 0])    # Lower red range
+        # lower boundary RED color range values; Hue (0 - 10)
+        lower1 = np.array([0, 120, 0])
         upper1 = np.array([10, 255, 255])
-        lower2 = np.array([160, 120, 0])  # Upper red range
+        
+        # upper boundary RED color range values; Hue (160 - 180)
+        lower2 = np.array([160, 120, 0])
         upper2 = np.array([185, 255, 255])
         
         # Create masks for both red ranges
@@ -158,53 +279,30 @@ class SignDetector:
         red_mask = lower_mask | upper_mask  # Combine both masks
         
         # Apply morphological operations to clean up the mask
-        kernel = np.ones((5, 5), np.uint8)
+        kernel = np.ones((5, 5), np.uint8)  # don't change 5
         red_mask = cv2.dilate(red_mask, kernel, iterations=1)
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, kernel)
         red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, kernel)
         
-        return red_mask
+        # Create red segmented image
+        red_segmented_image = cv2.bitwise_and(image, image, mask=red_mask)
+        gray = cv2.cvtColor(red_segmented_image, cv2.COLOR_BGR2GRAY)
+        
+        # Find contours in the opened mask
+        contours, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        min_area_threshold = 100
+        max_area_threshold = 8000
+        
+        # Filter out contours with area less than the threshold and fill them with black color
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if area < min_area_threshold or area > max_area_threshold:
+                cv2.drawContours(gray, [contour], 0, (0, 255, 0), -1)
+        
+        red_segmented_image = cv2.bitwise_and(image, image, mask=gray)
+        
+        return gray
     
-    def _extract_feature_vector(self, image, bbox):
-        """
-        Extract a simple feature vector from the detected region.
-        
-        This creates a compact representation of the detected sign.
-        For now, we use a simple approach: resize the cropped region and flatten it.
-        Later, this can be replaced with more sophisticated feature extraction.
-        
-        Args:
-            image (numpy.ndarray): Full image
-            bbox (tuple): Bounding box (x1, y1, x2, y2)
-            
-        Returns:
-            numpy.ndarray: Feature vector of fixed size
-        """
-        x1, y1, x2, y2 = bbox
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        
-        # Ensure coordinates are within image bounds
-        h, w = image.shape[:2]
-        x1 = max(0, min(x1, w))
-        y1 = max(0, min(y1, h))
-        x2 = max(0, min(x2, w))
-        y2 = max(0, min(y2, h))
-        
-        # Crop the detected region
-        cropped = image[y1:y2, x1:x2]
-        
-        if cropped.size == 0:
-            # Return zero vector if crop is invalid
-            return np.zeros(128, dtype=np.float32)
-        
-        # Resize to fixed size and convert to grayscale for compactness
-        cropped_resized = cv2.resize(cropped, (16, 16))
-        gray = cv2.cvtColor(cropped_resized, cv2.COLOR_BGR2GRAY)
-        
-        # Flatten and normalize
-        feature = gray.flatten().astype(np.float32) / 255.0
-        
-        return feature
     
     def detect(self, frame, conf_threshold=0.3):
         """
@@ -223,7 +321,6 @@ class SignDetector:
                 - class_name (str): Name of the sign (e.g., "Stop", "Yield")
                 - confidence (float): Detection confidence score
                 - bbox (tuple): Bounding box coordinates (x1, y1, x2, y2)
-                - feature_vector (numpy.ndarray): Feature representation of the detection
         """
         detections = []
         
@@ -243,9 +340,14 @@ class SignDetector:
             
             # Adjust confidence based on red mask presence
             # If the detected region doesn't overlap with red areas, reduce confidence
-            box_mask_region = red_mask[int(y_min):int(y_max), int(x_min):int(x_max)]
-            if box_mask_region.size > 0 and not box_mask_region.any():
-                confidence = confidence * 0.5  # Reduce confidence if no red detected
+            # This matches the original pipeline logic exactly
+            try:
+                box_mask_region = red_mask[int(y_min):int(y_max), int(x_min):int(x_max)]
+                if not box_mask_region.any():
+                    confidence = confidence * 0.5  # Reduce confidence if no red detected
+            except (IndexError, ValueError):
+                # If mask region is out of bounds, skip confidence adjustment
+                pass
             
             # Only process detections above threshold
             if confidence > conf_threshold:
@@ -265,16 +367,12 @@ class SignDetector:
                     # Get class name
                     class_name = self.classes[int(class_id)]
                     
-                    # Extract feature vector
-                    feature_vector = self._extract_feature_vector(frame, (x_min, y_min, x_max, y_max))
-                    
                     # Create detection dictionary
                     detection = {
                         'model_type': 'traffic_sign',
                         'class_name': class_name,
                         'confidence': float(confidence * recog_confidence),  # Combined confidence
-                        'bbox': (int(x_min), int(y_min), int(x_max), int(y_max)),
-                        'feature_vector': feature_vector
+                        'bbox': (int(x_min), int(y_min), int(x_max), int(y_max))
                     }
                     
                     detections.append(detection)

@@ -133,8 +133,7 @@ def detect(self, frame):
             'model_type': 'traffic_sign',
             'class_name': class_name,
             'confidence': confidence,
-            'bbox': (x_min, y_min, x_max, y_max),
-            'feature_vector': [128-dim array]
+            'bbox': (x_min, y_min, x_max, y_max)
         }
         detections.append(detection)
     
@@ -178,8 +177,7 @@ def detect(self, frame):
                 'model_type': 'traffic_signal',
                 'class_name': class_name,
                 'confidence': confidence,
-                'bbox': (x1, y1, x2, y2),
-                'feature_vector': [128-dim array]
+                'bbox': (x1, y1, x2, y2)
             }
             detections.append(detection)
     
@@ -222,8 +220,7 @@ def detect(self, frame):
                 'model_type': 'road_anomaly',
                 'class_name': class_name,
                 'confidence': confidence,
-                'bbox': (x1, y1, x2, y2),
-                'feature_vector': [128-dim array]
+                'bbox': (x1, y1, x2, y2)
             }
             detections.append(detection)
     
@@ -323,7 +320,6 @@ def detect(self, frame):
    - Extracts bounding boxes
    - Gets class names
    - Calculates confidences
-   - Creates feature vectors
    - Formats into standard dictionary
 
 5. **Returns standardized detections** to main.py
@@ -337,7 +333,6 @@ def detect(self, frame):
 - **The wrapper handles** all the complexity of:
   - Different model formats (YOLOv5 vs YOLOv8)
   - Different output formats
-  - Feature extraction
   - Standardizing the output
 
 - **You just call** `detector.detect(frame)` and get clean, standardized results!

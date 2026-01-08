@@ -17,22 +17,8 @@ from pathlib import Path
 import os
 import sys
 
-# Try to import YOLOv5 utilities from signal_det directory
-signal_det_path = Path(__file__).parent.parent / 'signal_det' / 'signal_det'
-DetectMultiBackend = None
-select_device = None
-
-if signal_det_path.exists():
-    if str(signal_det_path) not in sys.path:
-        sys.path.insert(0, str(signal_det_path))
-    
-    try:
-        from models.common import DetectMultiBackend
-        from utils.torch_utils import select_device
-    except ImportError:
-        # Local YOLOv5 not available, will use fallback
-        DetectMultiBackend = None
-        select_device = None
+# YOLOv5 models are loaded via torch.hub or ultralytics YOLO
+# These methods handle preprocessing automatically
 
 
 class SignalDetector:
@@ -73,19 +59,7 @@ class SignalDetector:
         # Try multiple loading methods
         model_loaded = False
         
-        # Method 1: Try using local YOLOv5 DetectMultiBackend (best)
-        if DetectMultiBackend and select_device:
-            try:
-                self.device = select_device(device)
-                self.model = DetectMultiBackend(weights_path, device=self.device, dnn=False, fp16=False)
-                self.model.eval()
-                model_loaded = True
-                print("  ✓ Loaded using local YOLOv5 DetectMultiBackend")
-            except Exception as e:
-                print(f"  ⚠ Local YOLOv5 loading failed: {e}")
-                print("  Trying fallback method...")
-        
-        # Method 2: Try torch.hub without version specification (more compatible)
+        # Method 1: Try torch.hub without version specification (more compatible)
         if not model_loaded:
             try:
                 print("  Using torch.hub (ultralytics/yolov5)...")
@@ -100,9 +74,30 @@ class SignalDetector:
                 model_loaded = True
                 print("  ✓ Loaded using torch.hub")
             except Exception as e:
+                error_msg = str(e)
                 print(f"  ⚠ torch.hub loading failed: {e}")
+                # Check if dill is missing and try to install it
+                if 'dill' in error_msg.lower() or 'No module named \'dill\'' in error_msg:
+                    print("  Attempting to install missing 'dill' package...")
+                    try:
+                        import subprocess
+                        import sys
+                        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'dill', '--quiet'])
+                        print("  ✓ Successfully installed 'dill'. Retrying torch.hub...")
+                        # Retry loading
+                        self.model = torch.hub.load('ultralytics/yolov5', 'custom', 
+                                                   path=weights_path, 
+                                                   force_reload=False,
+                                                   source='github',
+                                                   device=self.device)
+                        self.model.eval()
+                        model_loaded = True
+                        print("  ✓ Loaded using torch.hub (after installing dill)")
+                    except Exception as install_error:
+                        print(f"  ⚠ Failed to install dill: {install_error}")
+                        print("  Please install dill manually: pip install dill")
         
-        # Method 3: Try ultralytics YOLO (can load YOLOv5 weights)
+        # Method 2: Try ultralytics YOLO (can load YOLOv5 weights)
         if not model_loaded:
             try:
                 print("  Trying ultralytics YOLO as fallback...")
@@ -112,12 +107,29 @@ class SignalDetector:
                 model_loaded = True
                 print("  ✓ Loaded using ultralytics YOLO")
             except Exception as e:
+                error_msg = str(e)
                 print(f"  ⚠ ultralytics YOLO loading failed: {e}")
+                # Check if dill is missing and try to install it
+                if 'dill' in error_msg.lower() or 'No module named \'dill\'' in error_msg:
+                    print("  Attempting to install missing 'dill' package...")
+                    try:
+                        import subprocess
+                        import sys
+                        subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'dill', '--quiet'])
+                        print("  ✓ Successfully installed 'dill'. Retrying ultralytics YOLO...")
+                        # Retry loading
+                        from ultralytics import YOLO
+                        self.model = YOLO(weights_path)
+                        model_loaded = True
+                        print("  ✓ Loaded using ultralytics YOLO (after installing dill)")
+                    except Exception as install_error:
+                        print(f"  ⚠ Failed to install dill: {install_error}")
+                        print("  Please install dill manually: pip install dill")
         
         if not model_loaded:
             raise RuntimeError(
                 f"Failed to load model from {weights_path}. "
-                "Tried DetectMultiBackend, torch.hub, and ultralytics YOLO. "
+                "Tried torch.hub and ultralytics YOLO. "
                 "Please check that the weights file is valid."
             )
         
@@ -125,56 +137,23 @@ class SignalDetector:
         if not hasattr(self, 'device'):
             self.device = torch.device('cpu')
         
-        # Traffic light class names (3 classes)
+        # Traffic light class names (3 classes) - matching data.yaml
         self.classes = ['green', 'red', 'yellow']
+        
+        # Verify model.names is loaded correctly
+        if hasattr(self.model, 'names'):
+            model_names = self.model.names
+            if isinstance(model_names, dict):
+                print(f"  Model class names: {model_names}")
+            elif isinstance(model_names, (list, tuple)):
+                print(f"  Model class names (list): {list(model_names)}")
+            else:
+                print(f"  Model class names (unknown format): {model_names}")
+        else:
+            print(f"  Warning: model.names not found, using default: {self.classes}")
         
         print("Traffic signal detection model loaded successfully!")
     
-    def _extract_feature_vector(self, image, bbox):
-        """
-        Extract a simple feature vector from the detected traffic light region.
-        
-        This creates a compact representation of the detected traffic light.
-        We resize the cropped region and extract color and shape features.
-        
-        Args:
-            image (numpy.ndarray): Full image
-            bbox (tuple): Bounding box (x1, y1, x2, y2)
-            
-        Returns:
-            numpy.ndarray: Feature vector of fixed size
-        """
-        x1, y1, x2, y2 = bbox
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        
-        # Ensure coordinates are within image bounds
-        h, w = image.shape[:2]
-        x1 = max(0, min(x1, w))
-        y1 = max(0, min(y1, h))
-        x2 = max(0, min(x2, w))
-        y2 = max(0, min(y2, h))
-        
-        # Crop the detected region
-        cropped = image[y1:y2, x1:x2]
-        
-        if cropped.size == 0:
-            # Return zero vector if crop is invalid
-            return np.zeros(128, dtype=np.float32)
-        
-        # Resize to fixed size
-        cropped_resized = cv2.resize(cropped, (16, 16))
-        
-        # Convert to HSV to capture color information
-        hsv = cv2.cvtColor(cropped_resized, cv2.COLOR_BGR2HSV)
-        
-        # Extract features: mean HSV values and flattened image
-        mean_hsv = np.mean(hsv, axis=(0, 1)) / 255.0  # Normalize
-        flattened = cropped_resized.flatten() / 255.0  # Normalize
-        
-        # Combine into feature vector (3 HSV means + flattened image)
-        feature = np.concatenate([mean_hsv, flattened[:125]])  # Keep total size 128
-        
-        return feature.astype(np.float32)
     
     def detect(self, frame, conf_threshold=0.25):
         """
@@ -193,12 +172,11 @@ class SignalDetector:
                 - class_name (str): Color of the light ("red", "green", or "yellow")
                 - confidence (float): Detection confidence score
                 - bbox (tuple): Bounding box coordinates (x1, y1, x2, y2)
-                - feature_vector (numpy.ndarray): Feature representation of the detection
         """
         detections = []
         
         # Run model inference
-        # Handle different model types (DetectMultiBackend, torch.hub, or ultralytics YOLO)
+        # Handle different model types (torch.hub or ultralytics YOLO)
         
         # Check if it's ultralytics YOLO (has .predict method and returns Results objects)
         if hasattr(self.model, 'predict'):
@@ -223,15 +201,11 @@ class SignalDetector:
                             else:
                                 class_name = f"class_{class_id}"
                             
-                            # Extract feature vector
-                            feature_vector = self._extract_feature_vector(frame, (x1, y1, x2, y2))
-                            
                             detection = {
                                 'model_type': 'traffic_signal',
                                 'class_name': class_name,
                                 'confidence': confidence,
-                                'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                                'feature_vector': feature_vector
+                                'bbox': (int(x1), int(y1), int(x2), int(y2))
                             }
                             detections.append(detection)
                         return detections  # Successfully processed, return early
@@ -239,7 +213,7 @@ class SignalDetector:
                 # If predict fails or format is wrong, continue to other methods
                 pass
         
-        # Check if it's torch.hub YOLOv5 (has .names attribute and returns results object with .xyxy)
+        # Check if it's torch.hub YOLOv5 (has .names attribute)
         if hasattr(self.model, 'names'):
             try:
                 # torch.hub YOLOv5 format
@@ -265,74 +239,22 @@ class SignalDetector:
                             else:
                                 class_name = f"class_{class_id}"
                             
-                            # Extract feature vector
-                            feature_vector = self._extract_feature_vector(frame, (x_min, y_min, x_max, y_max))
-                            
                             # Create detection dictionary
                             detection = {
                                 'model_type': 'traffic_signal',
                                 'class_name': class_name,
                                 'confidence': float(confidence),
-                                'bbox': (int(x_min), int(y_min), int(x_max), int(y_max)),
-                                'feature_vector': feature_vector
+                                'bbox': (int(x_min), int(y_min), int(x_max), int(y_max))
                             }
                             
                             detections.append(detection)
                     return detections  # Successfully processed, return early
             except Exception as e:
-                # If torch.hub format fails, continue to DetectMultiBackend
+                # If torch.hub format fails
                 pass
-        
-        # Check if it's DetectMultiBackend (has .stride attribute)
-        if hasattr(self.model, 'stride'):
-            try:
-                from utils.general import non_max_suppression, scale_boxes
-                
-                # Preprocess image
-                img = torch.from_numpy(frame).to(self.device)
-                img = img.float() / 255.0  # Normalize to 0-1
-                img = img.permute(2, 0, 1).unsqueeze(0)  # HWC to BCHW
-                
-                # Run inference
-                pred = self.model(img, augment=False)
-                
-                # Apply NMS
-                pred = non_max_suppression(pred, conf_threshold, 0.45, max_det=1000)[0]
-                
-                # Process predictions
-                if len(pred) > 0:
-                    # Scale boxes to original image size
-                    pred[:, :4] = scale_boxes(img.shape[2:], pred[:, :4], frame.shape).round()
-                    
-                    for det in pred:
-                        x1, y1, x2, y2, conf, cls = det.cpu().numpy()
-                        class_id = int(cls)
-                        
-                        if class_id < len(self.classes):
-                            class_name = self.classes[class_id]
-                        else:
-                            class_name = f"class_{class_id}"
-                        
-                        # Extract feature vector
-                        feature_vector = self._extract_feature_vector(frame, (x1, y1, x2, y2))
-                        
-                        detection = {
-                            'model_type': 'traffic_signal',
-                            'class_name': class_name,
-                            'confidence': float(conf),
-                            'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                            'feature_vector': feature_vector
-                        }
-                        
-                        detections.append(detection)
-                    return detections  # Successfully processed, return early
-            except ImportError:
-                print("Warning: Could not import YOLOv5 utilities for DetectMultiBackend")
         
         # If we get here, no method worked
         print("Warning: Could not determine model format for signal detection")
-        return detections
-        
         return detections
 
 
@@ -352,7 +274,7 @@ if __name__ == "__main__":
         print(f"\n✗ Error initializing detector: {e}")
         print("\nMake sure:")
         print("1. Weight file exists at signal_det/signal_det/yolov5 trained model.pt")
-        print("2. YOLOv5 utilities are available")
+        print("2. torch.hub or ultralytics YOLO is available")
         sys.exit(1)
     
     # Test with a sample image (if provided)

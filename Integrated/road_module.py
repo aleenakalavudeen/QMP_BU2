@@ -1,13 +1,14 @@
 """
 Road Anomaly Detection Module (Potholes and Speedbumps)
 
-This module wraps the YOLOv8 model for detecting road anomalies.
-The best performing model is YOLOv8, which detects:
+This module uses the same logic as speedbump_pothole_det/detect.py for detecting road anomalies.
+It supports both YOLOv5 (using DetectMultiBackend) and YOLOv8 (using ultralytics).
+The module detects:
 - Potholes
 - Speedbumps
 
-Note: If YOLOv8 weights are not available, this will attempt to use YOLOv5 weights
-as a fallback, but YOLOv8 is recommended for best performance.
+Note: YOLOv5 with DetectMultiBackend is preferred to match the original detect.py logic.
+YOLOv8 is available as an alternative.
 
 Author: Integrated Traffic Perception System
 """
@@ -19,6 +20,30 @@ from pathlib import Path, WindowsPath
 import os
 import sys
 import pickle
+
+# Try to import YOLOv5 utilities from signal_det directory (same as detect.py uses)
+signal_det_path = Path(__file__).parent.parent / 'signal_det' / 'signal_det'
+DetectMultiBackend = None
+select_device = None
+non_max_suppression = None
+scale_boxes = None
+check_img_size = None
+
+if signal_det_path.exists():
+    if str(signal_det_path) not in sys.path:
+        sys.path.insert(0, str(signal_det_path))
+    
+    try:
+        from models.common import DetectMultiBackend
+        from utils.torch_utils import select_device
+        from utils.general import non_max_suppression, scale_boxes, check_img_size
+    except ImportError:
+        # Local YOLOv5 not available, will use fallback
+        DetectMultiBackend = None
+        select_device = None
+        non_max_suppression = None
+        scale_boxes = None
+        check_img_size = None
 
 # Try to import ultralytics YOLO (for YOLOv8)
 try:
@@ -154,11 +179,44 @@ class RoadAnomalyDetector:
         
         print(f"Loading road anomaly detection model ({self.model_type.upper()}) from: {weights_path}")
         
-        # Load model based on type
+        # Try to find data.yaml file (same as detect.py)
+        base_dir = Path(__file__).parent.parent
+        data_yaml_path = None
+        possible_data_yamls = [
+            base_dir / 'speedbump_pothole_det' / 'speedbump_pothole_det' / 'dataset' / 'data.yaml',
+        ]
+        
+        for data_yaml in possible_data_yamls:
+            if data_yaml.exists():
+                data_yaml_path = str(data_yaml)
+                print(f"  Found data.yaml at: {data_yaml_path}")
+                break
+        
+        # Load model based on type - prioritize DetectMultiBackend for YOLOv5 (same as detect.py)
         model_loaded = False
         
-        if self.model_type == 'yolov8' and ULTRALYTICS_AVAILABLE:
-            # Method 1: Try ultralytics YOLO for YOLOv8 weights
+        # Method 1: For YOLOv5, try DetectMultiBackend first (same logic as detect.py)
+        if self.model_type == 'yolov5' and DetectMultiBackend and select_device:
+            try:
+                device_obj = select_device(device if device else '')
+                self.device = device_obj
+                # Use DetectMultiBackend with same parameters as detect.py
+                self.model = DetectMultiBackend(
+                    weights_path,
+                    device=device_obj,
+                    dnn=False,
+                    fp16=False,
+                    data=data_yaml_path if data_yaml_path else None
+                )
+                self.model.eval()
+                model_loaded = True
+                print("  ✓ Loaded using DetectMultiBackend (YOLOv5) - same as detect.py")
+            except Exception as e:
+                print(f"  ⚠ DetectMultiBackend loading failed: {e}")
+                print("  Trying torch.hub fallback...")
+        
+        # Method 2: For YOLOv8, try ultralytics YOLO
+        if not model_loaded and self.model_type == 'yolov8' and ULTRALYTICS_AVAILABLE:
             try:
                 self.model = UltralyticsYOLO(weights_path)
                 model_loaded = True
@@ -167,8 +225,8 @@ class RoadAnomalyDetector:
                 print(f"  ⚠ ultralytics YOLO loading failed: {e}")
                 print("  Trying torch.hub fallback...")
         
+        # Method 3: Fallback to torch.hub for YOLOv5 weights
         if not model_loaded:
-            # Method 2: Use torch.hub for YOLOv5 weights (more compatible)
             try:
                 print("  Using torch.hub for YOLOv5 weights...")
                 # Try loading with force_reload to clear cache issues
@@ -193,7 +251,7 @@ class RoadAnomalyDetector:
             except Exception as e:
                 print(f"  ⚠ torch.hub loading failed: {e}")
                 print("  Trying Windows compatibility fix...")
-                # Method 3: Try loading with Windows PosixPath fix
+                # Method 4: Try loading with Windows PosixPath fix
                 try:
                     self.model = load_yolov5_weights_windows_fix(weights_path)
                     model_loaded = True
@@ -205,7 +263,7 @@ class RoadAnomalyDetector:
         if not model_loaded:
             raise RuntimeError(
                 f"Failed to load model from {weights_path}. "
-                "Tried ultralytics YOLO and torch.hub. "
+                "Tried DetectMultiBackend, ultralytics YOLO, and torch.hub. "
                 "Please check that the weights file is valid."
             )
         
@@ -213,78 +271,53 @@ class RoadAnomalyDetector:
         if hasattr(self.model, 'to'):
             self.model.to(self.device)
         
-        # Road anomaly class names
-        # Note: The model may detect potholes and speedbumps, or just potholes
-        # We'll use generic names and let the model tell us what it detects
+        # Road anomaly class names - same as detect.py gets from model
+        # Try to get class names from the model (same logic as detect.py)
         self.classes = ['pothole', 'speedbump']  # Default names
         
-        # Try to get class names from the model
         if hasattr(self.model, 'names'):
-            self.classes = list(self.model.names.values())
+            # Get names from model (same as detect.py line 167)
+            names = self.model.names
+            if isinstance(names, dict):
+                # Convert dict to list, handling both int keys and string values
+                max_key = max(names.keys()) if names else -1
+                if max_key >= 0:
+                    self.classes = [names.get(i, f'class_{i}') for i in range(max_key + 1)]
+                else:
+                    self.classes = list(names.values()) if names else ['pothole', 'speedbump']
+            elif isinstance(names, list):
+                self.classes = names
+            else:
+                # Fallback: try to get from model attributes
+                if hasattr(self.model, 'model') and hasattr(self.model.model, 'names'):
+                    model_names = self.model.model.names
+                    if isinstance(model_names, dict):
+                        max_key = max(model_names.keys()) if model_names else -1
+                        if max_key >= 0:
+                            self.classes = [model_names.get(i, f'class_{i}') for i in range(max_key + 1)]
+                        else:
+                            self.classes = list(model_names.values()) if model_names else ['pothole', 'speedbump']
+                    elif isinstance(model_names, list):
+                        self.classes = model_names
         
         print(f"Road anomaly detection model loaded successfully!")
         print(f"  Model type: {self.model_type.upper()}")
         print(f"  Classes: {self.classes}")
     
-    def _extract_feature_vector(self, image, bbox):
-        """
-        Extract a simple feature vector from the detected road anomaly region.
-        
-        This creates a compact representation of the detected anomaly.
-        We resize the cropped region and extract texture/shape features.
-        
-        Args:
-            image (numpy.ndarray): Full image
-            bbox (tuple): Bounding box (x1, y1, x2, y2)
-            
-        Returns:
-            numpy.ndarray: Feature vector of fixed size
-        """
-        x1, y1, x2, y2 = bbox
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        
-        # Ensure coordinates are within image bounds
-        h, w = image.shape[:2]
-        x1 = max(0, min(x1, w))
-        y1 = max(0, min(y1, h))
-        x2 = max(0, min(x2, w))
-        y2 = max(0, min(y2, h))
-        
-        # Crop the detected region
-        cropped = image[y1:y2, x1:x2]
-        
-        if cropped.size == 0:
-            # Return zero vector if crop is invalid
-            return np.zeros(128, dtype=np.float32)
-        
-        # Resize to fixed size
-        cropped_resized = cv2.resize(cropped, (16, 16))
-        
-        # Convert to grayscale for texture analysis
-        gray = cv2.cvtColor(cropped_resized, cv2.COLOR_BGR2GRAY)
-        
-        # Calculate texture features using simple statistics
-        mean_intensity = np.mean(gray) / 255.0
-        std_intensity = np.std(gray) / 255.0
-        
-        # Flatten the image
-        flattened = gray.flatten() / 255.0
-        
-        # Combine features: mean, std, and flattened image
-        feature = np.concatenate([[mean_intensity, std_intensity], flattened[:126]])
-        
-        return feature.astype(np.float32)
     
-    def detect(self, frame, conf_threshold=0.25):
+    def detect(self, frame, conf_threshold=0.25, iou_threshold=0.45, max_det=1000):
         """
         Detect road anomalies (potholes and speedbumps) in a video frame.
         
-        This is the main method you'll call. It takes a BGR image and returns
-        a list of detection dictionaries.
+        This method uses the same logic as speedbump_pothole_det/detect.py:
+        - For YOLOv5: Uses DetectMultiBackend with proper preprocessing, NMS, and box scaling
+        - For YOLOv8: Uses ultralytics YOLO
         
         Args:
             frame (numpy.ndarray): BGR image (height, width, 3 channels)
-            conf_threshold (float): Minimum confidence for detections (default: 0.25)
+            conf_threshold (float): Minimum confidence for detections (default: 0.25, same as detect.py)
+            iou_threshold (float): NMS IoU threshold (default: 0.45, same as detect.py)
+            max_det (int): Maximum detections per image (default: 1000, same as detect.py)
             
         Returns:
             list: List of detection dictionaries, each containing:
@@ -292,96 +325,158 @@ class RoadAnomalyDetector:
                 - class_name (str): Type of anomaly ("pothole", "speedbump", etc.)
                 - confidence (float): Detection confidence score
                 - bbox (tuple): Bounding box coordinates (x1, y1, x2, y2)
-                - feature_vector (numpy.ndarray): Feature representation of the detection
         """
         detections = []
         
-        # Run model inference - handle both ultralytics YOLO and torch.hub formats
-        if hasattr(self.model, 'predict') and not hasattr(self.model, 'names'):
-            # Ultralytics YOLO format (YOLOv8)
-            results = self.model.predict(frame, conf=conf_threshold, verbose=False)
-            
-            # Process results
-            if len(results) > 0:
-                result = results[0]
+        # Method 1: DetectMultiBackend (YOLOv5) - same logic as detect.py
+        if hasattr(self.model, 'stride') and non_max_suppression and scale_boxes:
+            try:
+                # Preprocess image - same as detect.py lines 186-191
+                im = torch.from_numpy(frame).to(self.model.device)
+                im = im.half() if self.model.fp16 else im.float()  # uint8 to fp16/32
+                im /= 255  # 0 - 255 to 0.0 - 1.0
+                if len(im.shape) == 3:
+                    im = im[None]  # expand for batch dim
                 
-                # Get bounding boxes and predictions
-                if result.boxes is not None:
-                    boxes = result.boxes
+                # Inference - same as detect.py line 207
+                pred = self.model(im, augment=False, visualize=False)
+                
+                # NMS - same as detect.py line 210
+                pred = non_max_suppression(pred, conf_threshold, iou_threshold, None, False, max_det=max_det)
+                
+                # Process predictions - same as detect.py lines 245-280
+                if len(pred) > 0 and len(pred[0]) > 0:
+                    det = pred[0]
                     
-                    # Extract information for each detection
-                    for i in range(len(boxes)):
-                        # Get bounding box coordinates
-                        box = boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
-                        x1, y1, x2, y2 = box
-                        
-                        # Get confidence
-                        confidence = float(boxes.conf[i].cpu().numpy())
-                        
-                        # Get class ID and name
-                        class_id = int(boxes.cls[i].cpu().numpy())
+                    # Rescale boxes from img_size to im0 size - same as detect.py line 247
+                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], frame.shape).round()
+                    
+                    # Get class names from model
+                    names = self.model.names if hasattr(self.model, 'names') else self.classes
+                    if isinstance(names, dict):
+                        # Convert dict to list if needed
+                        max_class_id = max(names.keys()) if names else 0
+                        names_list = [names.get(i, f'class_{i}') for i in range(max_class_id + 1)]
+                    else:
+                        names_list = names if isinstance(names, list) else self.classes
+                    
+                    # Process each detection - same as detect.py lines 255-280
+                    for *xyxy, conf, cls in reversed(det):
+                        c = int(cls)  # integer class
+                        confidence = float(conf)
                         
                         # Get class name
-                        if class_id < len(self.classes):
-                            class_name = self.classes[class_id]
+                        if c < len(names_list):
+                            class_name = names_list[c]
+                        elif c < len(self.classes):
+                            class_name = self.classes[c]
                         else:
-                            class_name = f"anomaly_{class_id}"
-                        
-                        # Extract feature vector
-                        feature_vector = self._extract_feature_vector(frame, (x1, y1, x2, y2))
+                            class_name = f"anomaly_{c}"
                         
                         # Create detection dictionary
                         detection = {
                             'model_type': 'road_anomaly',
                             'class_name': class_name,
                             'confidence': confidence,
-                            'bbox': (int(x1), int(y1), int(x2), int(y2)),
-                            'feature_vector': feature_vector
+                            'bbox': (int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3]))
                         }
                         
                         detections.append(detection)
+                
+                return detections  # Successfully processed with DetectMultiBackend
+            except Exception as e:
+                print(f"  ⚠ DetectMultiBackend inference failed: {e}")
+                print("  Trying alternative methods...")
         
-        elif hasattr(self.model, 'names'):
-            # torch.hub YOLOv5 format
-            results = self.model(frame)
-            
-            # Get bounding boxes
-            # results.xyxy[0] contains: [x1, y1, x2, y2, confidence, class_id]
-            if len(results.xyxy) > 0 and len(results.xyxy[0]) > 0:
-                bounding_boxes = results.xyxy[0].cpu().numpy()
+        # Method 2: Ultralytics YOLO format (YOLOv8)
+        if hasattr(self.model, 'predict') and not hasattr(self.model, 'names'):
+            try:
+                results = self.model.predict(frame, conf=conf_threshold, verbose=False)
                 
-                # Get class names from model
-                model_classes = self.model.names if hasattr(self.model, 'names') else {0: 'pothole'}
-                
-                # Process each detection
-                for box in bounding_boxes:
-                    x_min, y_min, x_max, y_max, confidence, class_id = box
-                    class_id = int(class_id)
+                # Process results
+                if len(results) > 0:
+                    result = results[0]
                     
-                    # Filter by confidence threshold
-                    if confidence > conf_threshold:
-                        # Get class name
-                        if class_id in model_classes:
-                            class_name = model_classes[class_id]
-                        elif class_id < len(self.classes):
-                            class_name = self.classes[class_id]
-                        else:
-                            class_name = f"anomaly_{class_id}"
+                    # Get bounding boxes and predictions
+                    if result.boxes is not None:
+                        boxes = result.boxes
                         
-                        # Extract feature vector
-                        feature_vector = self._extract_feature_vector(frame, (x_min, y_min, x_max, y_max))
-                        
-                        # Create detection dictionary
-                        detection = {
-                            'model_type': 'road_anomaly',
-                            'class_name': class_name,
-                            'confidence': float(confidence),
-                            'bbox': (int(x_min), int(y_min), int(x_max), int(y_max)),
-                            'feature_vector': feature_vector
-                        }
-                        
-                        detections.append(detection)
+                        # Extract information for each detection
+                        for i in range(len(boxes)):
+                            # Get bounding box coordinates
+                            box = boxes.xyxy[i].cpu().numpy()  # [x1, y1, x2, y2]
+                            x1, y1, x2, y2 = box
+                            
+                            # Get confidence
+                            confidence = float(boxes.conf[i].cpu().numpy())
+                            
+                            # Get class ID and name
+                            class_id = int(boxes.cls[i].cpu().numpy())
+                            
+                            # Get class name
+                            if class_id < len(self.classes):
+                                class_name = self.classes[class_id]
+                            else:
+                                class_name = f"anomaly_{class_id}"
+                            
+                            # Create detection dictionary
+                            detection = {
+                                'model_type': 'road_anomaly',
+                                'class_name': class_name,
+                                'confidence': confidence,
+                                'bbox': (int(x1), int(y1), int(x2), int(y2))
+                            }
+                            
+                            detections.append(detection)
+                
+                return detections  # Successfully processed with ultralytics YOLO
+            except Exception as e:
+                print(f"  ⚠ Ultralytics YOLO inference failed: {e}")
         
+        # Method 3: torch.hub YOLOv5 format (fallback)
+        if hasattr(self.model, 'names'):
+            try:
+                results = self.model(frame)
+                
+                # Get bounding boxes
+                # results.xyxy[0] contains: [x1, y1, x2, y2, confidence, class_id]
+                if len(results.xyxy) > 0 and len(results.xyxy[0]) > 0:
+                    bounding_boxes = results.xyxy[0].cpu().numpy()
+                    
+                    # Get class names from model
+                    model_classes = self.model.names if hasattr(self.model, 'names') else {0: 'pothole'}
+                    
+                    # Process each detection
+                    for box in bounding_boxes:
+                        x_min, y_min, x_max, y_max, confidence, class_id = box
+                        class_id = int(class_id)
+                        
+                        # Filter by confidence threshold
+                        if confidence > conf_threshold:
+                            # Get class name
+                            if isinstance(model_classes, dict):
+                                class_name = model_classes.get(class_id, f"anomaly_{class_id}")
+                            elif class_id < len(self.classes):
+                                class_name = self.classes[class_id]
+                            else:
+                                class_name = f"anomaly_{class_id}"
+                            
+                            # Create detection dictionary
+                            detection = {
+                                'model_type': 'road_anomaly',
+                                'class_name': class_name,
+                                'confidence': float(confidence),
+                                'bbox': (int(x_min), int(y_min), int(x_max), int(y_max))
+                            }
+                            
+                            detections.append(detection)
+                
+                return detections  # Successfully processed with torch.hub
+            except Exception as e:
+                print(f"  ⚠ torch.hub inference failed: {e}")
+        
+        # If we get here, no method worked
+        print("Warning: Could not determine model format for road anomaly detection")
         return detections
 
 

@@ -41,7 +41,6 @@ Each detection is a dictionary with:
 - `class_name`: Name of the detected class (e.g., "Stop", "red", "pothole")
 - `confidence`: Confidence score (0.0 to 1.0)
 - `bbox`: Bounding box tuple (x1, y1, x2, y2)
-- `feature_vector`: NumPy array of features (128 dimensions)
 
 ## Testing the Modules
 
@@ -108,23 +107,13 @@ For each frame, the pipeline returns a dictionary with:
   - `class_name`: e.g., "Stop", "red", "pothole"
   - `confidence`: float between 0 and 1
   - `bbox`: (x1, y1, x2, y2) in pixels
-  - `feature_vector`: 128-dimensional numpy array
 
 **B. Confidence Summaries** (`confidence_summaries`)
 - `sign_model`: List of all sign detection confidences
 - `signal_model`: List of all signal detection confidences
 - `anomaly_model`: List of all anomaly detection confidences
 
-**C. Fused Feature Vector** (`fused_feature_vector`)
-- Single 256-dimensional vector combining:
-  - Pooled features from sign model (128 dims)
-  - Pooled features from signal model (128 dims)
-  - Pooled features from anomaly model (128 dims)
-  - Aggregated confidence statistics (6 dims)
-  - Normalized and compressed to 256 dimensions
-  - Ready for quantum module input
-
-**D. Annotated Frame** (`annotated_frame`)
+**C. Annotated Frame** (`annotated_frame`)
 - Original frame with colored bounding boxes and labels
 - Green boxes: Traffic signs
 - Red boxes: Traffic signals
@@ -159,7 +148,6 @@ python main.py --source path/to/traffic_image.jpg
 ## Next Steps
 
 1. ✅ **Step 1 Complete**: Wrapper modules created
-2. ✅ **Step 2 Complete**: Integrated pipeline with feature fusion
-3. **Step 3**: Add quantum module integration (when ready)
-4. **Step 4**: Performance evaluation and optimization
+2. ✅ **Step 2 Complete**: Integrated pipeline
+3. **Step 3**: Performance evaluation and optimization
 
