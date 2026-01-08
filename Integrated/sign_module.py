@@ -324,59 +324,165 @@ class SignDetector:
         """
         detections = []
         
-        # Run detection model on the frame
+        # DEBUG: Get image dimensions
+        h, w = frame.shape[:2]
+        image_area = h * w
+        print(f"[DEBUG] Image dimensions: {w}x{h}, area: {image_area} pixels")
+        
+        # SPECIAL CASE: For very small images (likely already cropped signs),
+        # skip detection and go straight to recognition
+        # The original pipeline was designed for full video frames, not cropped images
+        # Very small images (< 15000 pixels, roughly < 122x122) are likely pre-cropped signs
+        if image_area < 15000:  # Very small images (likely cropped signs)
+            print(f"[DEBUG] Small image detected ({image_area} < 15000), skipping detection, going straight to recognition")
+            
+            # Treat entire image as a sign and go straight to recognition
+            # This handles cropped sign images that are too small for detection model
+            recog_pred = self.recog_model.predict(frame, conf=0.3, verbose=False)
+            
+            print(f"[DEBUG] Recognition prediction length: {len(recog_pred)}")
+            
+            if len(recog_pred) != 0:
+                print(f"[DEBUG] Recognition result has {len(recog_pred)} predictions")
+                try:
+                    # Check if probs attribute exists
+                    if hasattr(recog_pred[0], 'probs'):
+                        print(f"[DEBUG] Recognition result has probs attribute")
+                        preds = recog_pred[0].probs.cpu().numpy()
+                        class_id = np.argmax(preds.data)
+                        recog_confidence = float(preds.data[class_id])
+                        
+                        print(f"[DEBUG] Recognition - Class ID: {class_id}, Confidence: {recog_confidence:.4f}")
+                        
+                        # Get class name
+                        class_name = self.classes[int(class_id)]
+                        print(f"[DEBUG] Recognition - Class Name: {class_name}")
+                        
+                        # Create detection dictionary
+                        detection = {
+                            'model_type': 'traffic_sign',
+                            'class_name': class_name,
+                            'confidence': float(recog_confidence),
+                            'bbox': (0, 0, w, h)  # Full image as bounding box
+                        }
+                        detections.append(detection)
+                        print(f"[DEBUG] Added detection: {detection}")
+                    else:
+                        print(f"[DEBUG] WARNING: Recognition result does not have 'probs' attribute")
+                        print(f"[DEBUG] Recognition result attributes: {dir(recog_pred[0])}")
+                except (AttributeError, IndexError) as e:
+                    print(f"[DEBUG] ERROR in recognition processing: {type(e).__name__}: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"[DEBUG] Recognition returned empty results")
+            
+            print(f"[DEBUG] Returning {len(detections)} detections from small image path")
+            return detections
+        
+        # NORMAL PIPELINE: For full frames (original behavior)
+        print(f"[DEBUG] Normal pipeline: Running detection model on full frame")
         results = self.detect_model(frame)
         
         # Get bounding boxes from detection results
         # results.xyxy[0] contains: [x1, y1, x2, y2, confidence, class_id]
         bounding_boxes = results.xyxy[0].cpu().numpy()
+        print(f"[DEBUG] Detection model found {len(bounding_boxes)} bounding boxes")
+        
+        # IMPORTANT: Check if we have any detections at all
+        if len(bounding_boxes) == 0:
+            print(f"[DEBUG] No bounding boxes found, returning empty detections")
+            return detections  # Return early if no detections
+        
+        # Print details of each bounding box
+        for i, box in enumerate(bounding_boxes):
+            x_min, y_min, x_max, y_max, confidence, class_id = box
+            print(f"[DEBUG] Box {i}: bbox=({x_min:.1f}, {y_min:.1f}, {x_max:.1f}, {y_max:.1f}), conf={confidence:.4f}, class_id={class_id}")
         
         # Apply red color segmentation for filtering
+        print(f"[DEBUG] Applying red color segmentation")
         red_mask = self._red_color_segmentation(frame)
         
         # Process each detected bounding box
-        for box in bounding_boxes:
+        for box_idx, box in enumerate(bounding_boxes):
             x_min, y_min, x_max, y_max, confidence, _ = box
+            original_confidence = confidence
+            
+            print(f"[DEBUG] Processing box {box_idx}: original_confidence={confidence:.4f}")
             
             # Adjust confidence based on red mask presence
             # If the detected region doesn't overlap with red areas, reduce confidence
-            # This matches the original pipeline logic exactly
             try:
                 box_mask_region = red_mask[int(y_min):int(y_max), int(x_min):int(x_max)]
-                if not box_mask_region.any():
-                    confidence = confidence * 0.5  # Reduce confidence if no red detected
-            except (IndexError, ValueError):
+                if box_mask_region.size > 0:
+                    has_red = box_mask_region.any()
+                    print(f"[DEBUG] Box {box_idx}: Red mask region size={box_mask_region.size}, has_red={has_red}")
+                    if not has_red:
+                        confidence = confidence * 0.5  # Reduce confidence if no red detected
+                        print(f"[DEBUG] Box {box_idx}: Reduced confidence from {original_confidence:.4f} to {confidence:.4f}")
+                else:
+                    print(f"[DEBUG] Box {box_idx}: Red mask region is empty (size=0)")
+            except (IndexError, ValueError) as e:
+                print(f"[DEBUG] Box {box_idx}: Error accessing red mask region: {e}")
                 # If mask region is out of bounds, skip confidence adjustment
                 pass
             
+            print(f"[DEBUG] Box {box_idx}: Final confidence={confidence:.4f}, threshold={conf_threshold}")
+            
             # Only process detections above threshold
             if confidence > conf_threshold:
+                print(f"[DEBUG] Box {box_idx}: Confidence above threshold, running recognition")
                 # Crop the detected sign region
                 detected_img = frame[int(y_min):int(y_max), int(x_min):int(x_max)]
+                print(f"[DEBUG] Box {box_idx}: Cropped image size: {detected_img.shape}")
                 
                 # Run recognition model on the cropped sign
                 recog_pred = self.recog_model.predict(detected_img, conf=0.5, verbose=False)
+                print(f"[DEBUG] Box {box_idx}: Recognition prediction length: {len(recog_pred)}")
                 
                 # Check if recognition found a class
-                if len(recog_pred) != 0 and recog_pred[0].probs is not None:
-                    # Get class probabilities
-                    preds = recog_pred[0].probs.cpu().numpy()
-                    class_id = np.argmax(preds.data)
-                    recog_confidence = float(preds.data[class_id])
-                    
-                    # Get class name
-                    class_name = self.classes[int(class_id)]
-                    
-                    # Create detection dictionary
-                    detection = {
-                        'model_type': 'traffic_sign',
-                        'class_name': class_name,
-                        'confidence': float(confidence * recog_confidence),  # Combined confidence
-                        'bbox': (int(x_min), int(y_min), int(x_max), int(y_max))
-                    }
-                    
-                    detections.append(detection)
+                if len(recog_pred) != 0:
+                    try:
+                        # Check if probs attribute exists
+                        if hasattr(recog_pred[0], 'probs') and recog_pred[0].probs is not None:
+                            print(f"[DEBUG] Box {box_idx}: Recognition result has probs attribute")
+                            # Get class probabilities
+                            preds = recog_pred[0].probs.cpu().numpy()
+                            class_id = np.argmax(preds.data)
+                            recog_confidence = float(preds.data[class_id])
+                            
+                            print(f"[DEBUG] Box {box_idx}: Recognition - Class ID: {class_id}, Confidence: {recog_confidence:.4f}")
+                            
+                            # Get class name
+                            class_name = self.classes[int(class_id)]
+                            print(f"[DEBUG] Box {box_idx}: Recognition - Class Name: {class_name}")
+                            
+                            # Create detection dictionary
+                            detection = {
+                                'model_type': 'traffic_sign',
+                                'class_name': class_name,
+                                'confidence': float(confidence * recog_confidence),  # Combined confidence
+                                'bbox': (int(x_min), int(y_min), int(x_max), int(y_max))
+                            }
+                            
+                            detections.append(detection)
+                            print(f"[DEBUG] Box {box_idx}: Added detection: {detection}")
+                        else:
+                            print(f"[DEBUG] Box {box_idx}: WARNING: Recognition result does not have 'probs' attribute or probs is None")
+                            print(f"[DEBUG] Box {box_idx}: Recognition result attributes: {dir(recog_pred[0])}")
+                    except (AttributeError, IndexError) as e:
+                        print(f"[DEBUG] Box {box_idx}: ERROR in recognition processing: {type(e).__name__}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        # Skip if probs attribute doesn't exist or other error
+                        # This handles cases where recognition model returns results but without probs
+                        continue
+                else:
+                    print(f"[DEBUG] Box {box_idx}: Recognition returned empty results")
+            else:
+                print(f"[DEBUG] Box {box_idx}: Confidence below threshold, skipping")
         
+        print(f"[DEBUG] Final detections count: {len(detections)}")
         return detections
 
 
