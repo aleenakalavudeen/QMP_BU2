@@ -67,15 +67,15 @@ import os
 from collections import deque
 from typing import Dict, List, Optional, Tuple
 
-import utils
-import utils.image 
+import helpers
+import helpers.image 
 
 # Import from the original model (exactly as-is)
 from datasets.idd import IDD
 from engine.detector import Detector
 from model.squeezedet import SqueezeDet
-from utils.config import Config
-from utils.model import load_model
+from helpers.config import Config
+from helpers.model import load_model
 
 # Risk and congestion constants (from original model)
 class_ids_list = [0, 1, 2, 3, 4]  # lmv, person, two_wheeler, three_wheeler, hmv
