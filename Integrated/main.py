@@ -24,7 +24,7 @@ import cv2
 import numpy as np
 import argparse
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import time
 from concurrent.futures import ThreadPoolExecutor
 import threading
@@ -50,10 +50,11 @@ except ImportError:
 from sign_module import SignDetector
 from signal_module import SignalDetector
 from road_module import RoadAnomalyDetector
+from risk_congestion_module import RiskCongestionDetector, draw_text_with_bg
 
 
 
-VALID_MODELS = ['sign', 'signal', 'anomaly']
+VALID_MODELS = ['sign', 'signal', 'anomaly', 'risk_congestion']
 
 
 class IntegratedTrafficPerception:
@@ -73,7 +74,7 @@ class IntegratedTrafficPerception:
         
         Args:
             selected_models (list[str] | None): Models to load. Valid entries:
-                'sign', 'signal', 'anomaly'. Defaults to all.
+                'sign', 'signal', 'anomaly', 'risk_congestion'. Defaults to all.
             device (str): Device to run models on ('cpu', 'cuda', or '' for auto)
             use_parallel (bool): Whether to run model inferences in parallel (default: True)
         """
@@ -110,11 +111,22 @@ class IntegratedTrafficPerception:
         
         # Load road anomaly model if enabled
         if 'anomaly' in self.selected_models:
-            print("\n[3/3] Loading road anomaly detection model...")
+            print("\n[3/4] Loading road anomaly detection model...")
             self.road_detector = RoadAnomalyDetector(device=self.device)
         else:
-            print("\n[3/3] Skipping road anomaly detection model (disabled)")
+            print("\n[3/4] Skipping road anomaly detection model (disabled)")
             self.road_detector = None
+        
+        # Load risk & congestion model if enabled
+        if 'risk_congestion' in self.selected_models:
+            print("\n[4/4] Loading risk & congestion detection model...")
+            # FPS will be set later when processing video
+            self.risk_congestion_detector = RiskCongestionDetector(device=self.device)
+            self.risk_congestion_fps = None  # Will be set during video processing
+        else:
+            print("\n[4/4] Skipping risk & congestion detection model (disabled)")
+            self.risk_congestion_detector = None
+            self.risk_congestion_fps = None
         
         print("\n" + "=" * 70)
         print("All models loaded successfully! ✓")
@@ -125,6 +137,7 @@ class IntegratedTrafficPerception:
             'traffic_sign': (0, 255, 0),      # Green
             'traffic_signal': (0, 0, 255),    # Red
             'road_anomaly': (255, 0, 0),      # Blue
+            'risk_congestion': (255, 165, 0), # Orange
         }
         
         # Thread-safe detection methods using ThreadingLocked decorator
@@ -133,14 +146,17 @@ class IntegratedTrafficPerception:
             self._detect_sign_threadsafe = ThreadingLocked()(self._detect_sign_impl)
             self._detect_signal_threadsafe = ThreadingLocked()(self._detect_signal_impl)
             self._detect_anomaly_threadsafe = ThreadingLocked()(self._detect_anomaly_impl)
+            self._detect_risk_congestion_threadsafe = ThreadingLocked()(self._detect_risk_congestion_impl)
         else:
             # If ThreadingLocked not available, use locks manually
             self._sign_lock = threading.Lock()
             self._signal_lock = threading.Lock()
             self._anomaly_lock = threading.Lock()
+            self._risk_congestion_lock = threading.Lock()
             self._detect_sign_threadsafe = self._detect_sign_with_lock
             self._detect_signal_threadsafe = self._detect_signal_with_lock
             self._detect_anomaly_threadsafe = self._detect_anomaly_with_lock
+            self._detect_risk_congestion_threadsafe = self._detect_risk_congestion_with_lock
         
         # Initialize tracking for individual model outputs
         self._init_output_tracking()
@@ -170,6 +186,12 @@ class IntegratedTrafficPerception:
             return self.road_detector.detect(frame)
         return []
     
+    def _detect_risk_congestion_impl(self, frame: np.ndarray, frame_id: Optional[int] = None) -> Dict:
+        """Internal implementation for risk & congestion detection."""
+        if self.risk_congestion_detector:
+            return self.risk_congestion_detector.detect(frame, frame_id=frame_id)
+        return {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
+    
     def _detect_sign_with_lock(self, frame: np.ndarray) -> List[Dict]:
         """Thread-safe sign detection using manual lock."""
         with self._sign_lock:
@@ -185,6 +207,11 @@ class IntegratedTrafficPerception:
         with self._anomaly_lock:
             return self._detect_anomaly_impl(frame)
     
+    def _detect_risk_congestion_with_lock(self, frame: np.ndarray, frame_id: Optional[int] = None) -> Dict:
+        """Thread-safe risk & congestion detection using manual lock."""
+        with self._risk_congestion_lock:
+            return self._detect_risk_congestion_impl(frame, frame_id=frame_id)
+    
     def _init_output_tracking(self):
         """Initialize tracking structures for individual model outputs."""
         # Signal detection tracking
@@ -196,8 +223,13 @@ class IntegratedTrafficPerception:
         # Road anomaly detection tracking
         self.anomaly_detections_by_class = {}  # class_name -> count
         
+        # Risk & congestion detection tracking
+        self.risk_congestion_detections_by_class = {}  # class_name -> count
+        self.risk_metrics_history = []  # Store risk metrics over time
+        self.congestion_metrics_history = []  # Store congestion metrics over time
+        
     
-    def process_frame(self, frame: np.ndarray, use_parallel: bool = None, conf_threshold: float = 0.25) -> Dict:
+    def process_frame(self, frame: np.ndarray, use_parallel: bool = None, conf_threshold: float = 0.25, frame_id: Optional[int] = None) -> Dict:
         """
         Process a single frame through all models.
         
@@ -232,7 +264,8 @@ class IntegratedTrafficPerception:
         model_times = {
             'sign_model': 0.0,
             'signal_model': 0.0,
-            'anomaly_model': 0.0
+            'anomaly_model': 0.0,
+            'risk_congestion_model': 0.0
         }
         
         # Step 1: Run enabled models (in parallel if requested)
@@ -241,22 +274,25 @@ class IntegratedTrafficPerception:
             sign_detections = []
             signal_detections = []
             anomaly_detections = []
+            risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
             
             # Create a copy of the frame for each thread (to avoid potential issues)
             frame_copy = frame.copy()
             
             # Helper function to time a detection call
-            def timed_detect(detector_func, frame_copy, model_name, conf_thresh=None):
+            def timed_detect(detector_func, frame_copy, model_name, conf_thresh=None, frame_id=None):
                 start = time.time()
                 if conf_thresh is not None and model_name == 'signal':
                     result = detector_func(frame_copy, conf_threshold=conf_thresh)
+                elif model_name == 'risk_congestion':
+                    result = detector_func(frame_copy, frame_id=frame_id)
                 else:
                     result = detector_func(frame_copy)
                 elapsed = time.time() - start
                 return result, elapsed, model_name
             
             # Submit all detection tasks to thread pool
-            with ThreadPoolExecutor(max_workers=3) as executor:
+            with ThreadPoolExecutor(max_workers=4) as executor:
                 futures = {}
                 
                 if self.sign_detector:
@@ -265,6 +301,8 @@ class IntegratedTrafficPerception:
                     futures['signal'] = executor.submit(timed_detect, self._detect_signal_threadsafe, frame_copy, 'signal', conf_thresh=conf_threshold)
                 if self.road_detector:
                     futures['anomaly'] = executor.submit(timed_detect, self._detect_anomaly_threadsafe, frame_copy, 'anomaly')
+                if self.risk_congestion_detector:
+                    futures['risk_congestion'] = executor.submit(timed_detect, self._detect_risk_congestion_threadsafe, frame_copy, 'risk_congestion', frame_id=frame_id)
                 
                 # Collect results as they complete and track timing
                 for model_name, future in futures.items():
@@ -279,6 +317,9 @@ class IntegratedTrafficPerception:
                         elif model_name == 'anomaly':
                             anomaly_detections = result
                             model_times['anomaly_model'] = elapsed_time
+                        elif model_name == 'risk_congestion':
+                            risk_congestion_results = result
+                            model_times['risk_congestion_model'] = elapsed_time
                     except Exception as e:
                         print(f"Warning: Error in {model_name} detection: {e}")
                         if model_name == 'sign':
@@ -287,6 +328,8 @@ class IntegratedTrafficPerception:
                             signal_detections = []
                         elif model_name == 'anomaly':
                             anomaly_detections = []
+                        elif model_name == 'risk_congestion':
+                            risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
         else:
             # Sequential processing (fallback or when parallel disabled)
             if self.sign_detector:
@@ -309,23 +352,42 @@ class IntegratedTrafficPerception:
                 model_times['anomaly_model'] = time.time() - anomaly_start
             else:
                 anomaly_detections = []
+            
+            if self.risk_congestion_detector:
+                risk_congestion_start = time.time()
+                risk_congestion_results = self._detect_risk_congestion_threadsafe(frame, frame_id=frame_id)
+                model_times['risk_congestion_model'] = time.time() - risk_congestion_start
+            else:
+                risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
+        
+        # Extract risk_congestion detections
+        risk_congestion_detections = risk_congestion_results.get('detections', [])
+        risk_metrics = risk_congestion_results.get('risk_metrics', None)
+        congestion_metrics = risk_congestion_results.get('congestion_metrics', None)
         
         # Step 2: Combine all detections into a single list
-        all_detections = sign_detections + signal_detections + anomaly_detections
+        all_detections = sign_detections + signal_detections + anomaly_detections + risk_congestion_detections
         
         # Step 3: Create confidence summaries
         sign_confidences = [det['confidence'] for det in sign_detections]
         signal_confidences = [det['confidence'] for det in signal_detections]
         anomaly_confidences = [det['confidence'] for det in anomaly_detections]
+        risk_congestion_confidences = [det['confidence'] for det in risk_congestion_detections]
         
         confidence_summaries = {
             'sign_model': sign_confidences,
             'signal_model': signal_confidences,
-            'anomaly_model': anomaly_confidences
+            'anomaly_model': anomaly_confidences,
+            'risk_congestion_model': risk_congestion_confidences
         }
         
-        # Step 4: Create annotated frame
-        annotated_frame = self._draw_annotations(frame.copy(), all_detections)
+        # Step 4: Create annotated frame (with risk/PCU overlays if available)
+        annotated_frame = self._draw_annotations(
+            frame.copy(), 
+            all_detections,
+            risk_metrics=risk_metrics,
+            congestion_metrics=congestion_metrics
+        )
         
         # Step 5: Calculate processing time
         processing_time = time.time() - frame_start_time
@@ -342,7 +404,11 @@ class IntegratedTrafficPerception:
             # Separate lists (backward compatibility with simpler version)
             'sign_detections': sign_detections,
             'signal_detections': signal_detections,
-            'anomaly_detections': anomaly_detections
+            'anomaly_detections': anomaly_detections,
+            'risk_congestion_detections': risk_congestion_detections,
+            # Risk and congestion metrics
+            'risk_metrics': risk_metrics,
+            'congestion_metrics': congestion_metrics
         }
         
         return results
@@ -401,7 +467,8 @@ class IntegratedTrafficPerception:
             return False
     
     def _print_individual_model_outputs(self, signal_detections_by_class, sign_detections_by_class, 
-                                       anomaly_detections_by_class, frame_count):
+                                       anomaly_detections_by_class, risk_congestion_detections_by_class,
+                                       frame_count):
         """
         Print test outputs from individual models, similar to their standalone test outputs.
         
@@ -409,6 +476,7 @@ class IntegratedTrafficPerception:
             signal_detections_by_class: Dict of class_name -> count for signal detections
             sign_detections_by_class: Dict of class_name -> count for sign detections
             anomaly_detections_by_class: Dict of class_name -> count for anomaly detections
+            risk_congestion_detections_by_class: Dict of class_name -> count for risk_congestion detections
             frame_count: Total number of frames processed
         """
         print(f"\n{'='*70}")
@@ -459,15 +527,34 @@ class IntegratedTrafficPerception:
             print(f"  Format: Similar to speedbump_pothole_det/speedbump_pothole_det/val.py output")
             print(f"  (Precision/Recall/mAP would require ground truth labels)")
         
+        # Risk & Congestion Detection Model Outputs
+        if risk_congestion_detections_by_class or 'risk_congestion' in self.selected_models:
+            print(f"\n[4] RISK & CONGESTION DETECTION MODEL OUTPUTS (from driving_risk_and_congestion):")
+            print(f"  {'Class':<20} {'Count':<10}")
+            print(f"  {'-'*20} {'-'*10}")
+            if risk_congestion_detections_by_class:
+                total_risk_congestion = sum(risk_congestion_detections_by_class.values())
+                for class_name, count in sorted(risk_congestion_detections_by_class.items()):
+                    print(f"  {class_name:<20} {count:<10}")
+                print(f"  {'TOTAL':<20} {total_risk_congestion:<10}")
+            else:
+                print(f"  {'No detections':<20} {'0':<10}")
+            print(f"  Format: Similar to driving_risk_and_congestion/src/demoidd_riskest_cong.py output")
+        
         print(f"\n{'='*70}")
     
-    def _draw_annotations(self, frame: np.ndarray, detections: List[Dict]) -> np.ndarray:
+    def _draw_annotations(self, frame: np.ndarray, detections: List[Dict], 
+                         risk_metrics: Optional[Dict] = None, 
+                         congestion_metrics: Optional[Dict] = None) -> np.ndarray:
         """
         Draw bounding boxes and labels on the frame.
+        Also overlays risk labels and PCU values if available (matching original model).
         
         Args:
             frame (numpy.ndarray): Original frame
             detections (list): List of detection dictionaries
+            risk_metrics (dict | None): Risk metrics dict with 'risk_label' and 'smoothed_label'
+            congestion_metrics (dict | None): Congestion metrics dict with 'pcu_sum'
         
         Returns:
             numpy.ndarray: Annotated frame
@@ -523,6 +610,55 @@ class IntegratedTrafficPerception:
                 (255, 255, 255),  # White text
                 thickness
             )
+        
+        # Add risk and PCU overlays (matching original demoidd_video_riskest_cong.py)
+        if risk_metrics or congestion_metrics:
+            orig_height, orig_width = annotated.shape[:2]
+            x0 = int(0.7 * orig_width)
+            y0 = int(0.1 * orig_height)
+            
+            # Risk overlay (ONLY if smoothed label is available)
+            if risk_metrics and risk_metrics.get('smoothed_label'):
+                smooth_label = risk_metrics['smoothed_label']
+                color_map = {
+                    'LOW': (0, 255, 0),        # Green
+                    'MODERATE': (0, 165, 255),  # Orange
+                    'HIGH': (0, 0, 255),       # Red
+                    'CRITICAL': (0, 0, 139)     # Dark Red
+                }
+                
+                risk_color = color_map.get(smooth_label, (255, 255, 255))
+                
+                cv2.putText(
+                    annotated,
+                    f"Risk: {smooth_label}",
+                    (x0, y0),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    2,
+                    risk_color,
+                    10,
+                    cv2.LINE_AA
+                )
+                
+                pcu_y = y0 + 80
+            else:
+                # If risk not available yet, place PCU at default position
+                pcu_y = y0
+            
+            # PCU overlay (ALWAYS shown if available)
+            if congestion_metrics and congestion_metrics.get('pcu_sum') is not None:
+                pc_sum = congestion_metrics['pcu_sum']
+                draw_text_with_bg(
+                    annotated,
+                    f"PCU: {pc_sum:.2f}",
+                    (x0, pcu_y),
+                    font=cv2.FONT_HERSHEY_SIMPLEX,
+                    font_scale=1.2,
+                    text_color=(255, 255, 255),
+                    bg_color=(0, 0, 0),
+                    thickness=3,
+                    padding=12
+                )
         
         return annotated
     
@@ -736,6 +872,8 @@ class IntegratedTrafficPerception:
         print(f"  Sign Model - Average time per frame: {model_times.get('sign_model', 0.0):.4f} seconds ({model_times.get('sign_model', 0.0)*1000:.2f} ms)")
         print(f"  Signal Model - Average time per frame: {model_times.get('signal_model', 0.0):.4f} seconds ({model_times.get('signal_model', 0.0)*1000:.2f} ms)")
         print(f"  Anomaly Model - Average time per frame: {model_times.get('anomaly_model', 0.0):.4f} seconds ({model_times.get('anomaly_model', 0.0)*1000:.2f} ms)")
+        if 'risk_congestion_model' in model_times:
+            print(f"  Risk & Congestion Model - Average time per frame: {model_times.get('risk_congestion_model', 0.0):.4f} seconds ({model_times.get('risk_congestion_model', 0.0)*1000:.2f} ms)")
         
         if metrics:
             print(f"\nPERFORMANCE METRICS (with ground truth):")
@@ -764,6 +902,7 @@ class IntegratedTrafficPerception:
         signal_detections_by_class = {}
         sign_detections_by_class = {}
         anomaly_detections_by_class = {}
+        risk_congestion_detections_by_class = {}
         
         for det in results['detections']:
             model_type = det.get('model_type', 'unknown')
@@ -775,11 +914,14 @@ class IntegratedTrafficPerception:
                 sign_detections_by_class[class_name] = sign_detections_by_class.get(class_name, 0) + 1
             elif model_type == 'road_anomaly':
                 anomaly_detections_by_class[class_name] = anomaly_detections_by_class.get(class_name, 0) + 1
+            elif model_type == 'risk_congestion':
+                risk_congestion_detections_by_class[class_name] = risk_congestion_detections_by_class.get(class_name, 0) + 1
         
         self._print_individual_model_outputs(
             signal_detections_by_class,
             sign_detections_by_class,
             anomaly_detections_by_class,
+            risk_congestion_detections_by_class,
             1
         )
         
@@ -802,6 +944,21 @@ class IntegratedTrafficPerception:
         """
         print(f"\nProcessing video: {video_path}")
         
+        # Extract ground truth risk level from filename (matching riskest_vid_analysis.py)
+        video_name_upper = Path(video_path).stem.upper()
+        risk_level_ground_truth = None
+        if video_name_upper.startswith('LOW'):
+            risk_level_ground_truth = 'LOW'
+        elif video_name_upper.startswith('MODERATE'):
+            risk_level_ground_truth = 'MODERATE'
+        elif video_name_upper.startswith('HIGH'):
+            risk_level_ground_truth = 'HIGH'
+        elif video_name_upper.startswith('CRITICAL'):
+            risk_level_ground_truth = 'CRITICAL'
+        
+        # Track raw and smoothed risk labels for metrics calculation
+        raw_risk_labels = []
+        smoothed_risk_labels = []
         
         # Open video
         cap = cv2.VideoCapture(video_path)
@@ -815,6 +972,15 @@ class IntegratedTrafficPerception:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
         print(f"Video properties: {width}x{height} @ {fps} FPS ({total_frames} frames)")
+        
+        # Update risk_congestion detector with FPS for proper window size calculation
+        if self.risk_congestion_detector and fps > 0:
+            self.risk_congestion_fps = fps
+            # Reinitialize with FPS to set correct window size
+            self.risk_congestion_detector.set_smoothing_params(
+                window_size=int(fps * 2),  # Match original: window_size = int(ip_fps * 2)
+                decay_beta=0.001
+            )
         
         # Setup video writer if saving
         writer = None
@@ -862,7 +1028,8 @@ class IntegratedTrafficPerception:
         model_stats = {
             'traffic_sign': {'tp': 0, 'fp': 0, 'fn': 0},
             'traffic_signal': {'tp': 0, 'fp': 0, 'fn': 0},
-            'road_anomaly': {'tp': 0, 'fp': 0, 'fn': 0}
+            'road_anomaly': {'tp': 0, 'fp': 0, 'fn': 0},
+            'risk_congestion': {'tp': 0, 'fp': 0, 'fn': 0}
         }
         labels_path = Path(labels_dir) if labels_dir and Path(labels_dir).exists() else None
         video_name = Path(video_path).stem
@@ -872,12 +1039,14 @@ class IntegratedTrafficPerception:
         detection_counts = {
             'traffic_sign': 0,
             'traffic_signal': 0,
-            'road_anomaly': 0
+            'road_anomaly': 0,
+            'risk_congestion': 0
         }
         confidence_scores = {
             'traffic_sign': [],
             'traffic_signal': [],
-            'road_anomaly': []
+            'road_anomaly': [],
+            'risk_congestion': []
         }
         class_counts = {}  # Track counts per class name
         
@@ -885,7 +1054,11 @@ class IntegratedTrafficPerception:
         signal_detections_by_class = {}  # class_name -> count
         sign_detections_by_class = {}  # class_name -> count
         anomaly_detections_by_class = {}  # class_name -> count
+        risk_congestion_detections_by_class = {}  # class_name -> count
         all_detections_for_csv = []  # List of all detections for CSV output
+        
+        # Track risk and congestion metrics for original format CSV (matching demoidd_video_riskest_cong.py)
+        risk_congestion_frame_data = []  # List of dicts with frame-by-frame risk/congestion data
         
         while True:
             ret, frame = cap.read()
@@ -895,7 +1068,7 @@ class IntegratedTrafficPerception:
             frame_count += 1
             
             # Process frame
-            results = self.process_frame(frame)
+            results = self.process_frame(frame, frame_id=frame_count)
             
             # Track frame processing time
             frame_times.append(results['processing_time'])
@@ -938,6 +1111,11 @@ class IntegratedTrafficPerception:
                     if class_name not in anomaly_detections_by_class:
                         anomaly_detections_by_class[class_name] = 0
                     anomaly_detections_by_class[class_name] += 1
+                
+                elif model_type == 'risk_congestion':
+                    if class_name not in risk_congestion_detections_by_class:
+                        risk_congestion_detections_by_class[class_name] = 0
+                    risk_congestion_detections_by_class[class_name] += 1
                 
                 # Collect all detections for CSV output
                 video_name = Path(video_path).stem
@@ -1001,8 +1179,89 @@ class IntegratedTrafficPerception:
                     
                     for unmatched_gt in unmatched_gts:
                         model_type = self._infer_model_type_from_gt(unmatched_gt)
-                        if model_type in model_stats:
-                            model_stats[model_type]['fn'] += 1
+                    if model_type in model_stats:
+                        model_stats[model_type]['fn'] += 1
+            
+            # Track risk labels if available
+            risk_metrics = results.get('risk_metrics')
+            congestion_metrics = results.get('congestion_metrics')
+            
+            if risk_metrics or congestion_metrics:
+                # Store frame data for original format CSV
+                frame_data = {'Frame Number': frame_count}
+                
+                if risk_metrics:
+                    raw_label = risk_metrics.get('risk_label')
+                    smoothed_label = risk_metrics.get('smoothed_label')
+                    if raw_label:
+                        raw_risk_labels.append(raw_label)
+                        # Always append smoothed label (can be None during warm-up)
+                        smoothed_risk_labels.append(smoothed_label if smoothed_label else None)
+                    
+                    # Add risk metrics to frame data
+                    frame_data.update({
+                        'c0': risk_metrics.get('counts', [0]*5)[0],
+                        'c1': risk_metrics.get('counts', [0]*5)[1],
+                        'c2': risk_metrics.get('counts', [0]*5)[2],
+                        'c3': risk_metrics.get('counts', [0]*5)[3],
+                        'c4': risk_metrics.get('counts', [0]*5)[4],
+                        'a0': risk_metrics.get('areas', [0]*5)[0],
+                        'a1': risk_metrics.get('areas', [0]*5)[1],
+                        'a2': risk_metrics.get('areas', [0]*5)[2],
+                        'a3': risk_metrics.get('areas', [0]*5)[3],
+                        'a4': risk_metrics.get('areas', [0]*5)[4],
+                        'd0': risk_metrics.get('x_disps', [0]*5)[0],
+                        'd1': risk_metrics.get('x_disps', [0]*5)[1],
+                        'd2': risk_metrics.get('x_disps', [0]*5)[2],
+                        'd3': risk_metrics.get('x_disps', [0]*5)[3],
+                        'd4': risk_metrics.get('x_disps', [0]*5)[4],
+                        'b0': risk_metrics.get('combined', [0]*5)[0],
+                        'b1': risk_metrics.get('combined', [0]*5)[1],
+                        'b2': risk_metrics.get('combined', [0]*5)[2],
+                        'b3': risk_metrics.get('combined', [0]*5)[3],
+                        'b4': risk_metrics.get('combined', [0]*5)[4],
+                        'B_sum': risk_metrics.get('B_sum', 0.0),
+                        'Raw Label': raw_label if raw_label else '',
+                        'Smoothed Label': smoothed_label if smoothed_label else ''
+                    })
+                else:
+                    # Fill with zeros if no risk metrics
+                    frame_data.update({
+                        'c0': 0, 'c1': 0, 'c2': 0, 'c3': 0, 'c4': 0,
+                        'a0': 0, 'a1': 0, 'a2': 0, 'a3': 0, 'a4': 0,
+                        'd0': 0, 'd1': 0, 'd2': 0, 'd3': 0, 'd4': 0,
+                        'b0': 0, 'b1': 0, 'b2': 0, 'b3': 0, 'b4': 0,
+                        'B_sum': 0.0,
+                        'Raw Label': '',
+                        'Smoothed Label': ''
+                    })
+                
+                if congestion_metrics:
+                    # Add PCU metrics to frame data
+                    pcu_counts = congestion_metrics.get('counts', [0]*5)
+                    pcu_values = congestion_metrics.get('pcu_per_class', [0]*5)
+                    frame_data.update({
+                        'pc_c0': pcu_counts[0],
+                        'pc_c1': pcu_counts[1],
+                        'pc_c2': pcu_counts[2],
+                        'pc_c3': pcu_counts[3],
+                        'pc_c4': pcu_counts[4],
+                        'pc_p0': pcu_values[0],
+                        'pc_p1': pcu_values[1],
+                        'pc_p2': pcu_values[2],
+                        'pc_p3': pcu_values[3],
+                        'pc_p4': pcu_values[4],
+                        'PCU_Sum': congestion_metrics.get('pcu_sum', 0.0)
+                    })
+                else:
+                    # Fill with zeros if no congestion metrics
+                    frame_data.update({
+                        'pc_c0': 0, 'pc_c1': 0, 'pc_c2': 0, 'pc_c3': 0, 'pc_c4': 0,
+                        'pc_p0': 0.0, 'pc_p1': 0.0, 'pc_p2': 0.0, 'pc_p3': 0.0, 'pc_p4': 0.0,
+                        'PCU_Sum': 0.0
+                    })
+                
+                risk_congestion_frame_data.append(frame_data)
             
             # Show progress
             if frame_count % 30 == 0:
@@ -1045,7 +1304,102 @@ class IntegratedTrafficPerception:
                 times = [mt.get(model_name, 0.0) for mt in model_times_list if model_name in mt]
                 if times:
                     avg_model_times[model_name] = sum(times) / len(times)
+        
+        # Calculate risk level metrics if ground truth is available
+        total = frame_count
+        raw_accuracy = 0.0
+        smooth_accuracy = 0.0
+        raw_correct = 0
+        smooth_correct = 0
+        raw_total = 0
+        smooth_total = 0
+        raw_errors = 0
+        smooth_errors = 0
+        b = 0  # Frames improved by smoothing
+        c = 0  # Frames worsened by smoothing
+        mcnemar_stat = np.nan
+        p_value = np.nan
+        interpretation = "No ground truth available"
+        raw_prediction_counts = {}
+        smooth_prediction_counts = {}
+        raw_macro_precision = 0.0
+        raw_macro_recall = 0.0
+        raw_macro_f1 = 0.0
+        raw_micro_precision = 0.0
+        raw_micro_recall = 0.0
+        raw_micro_f1 = 0.0
+        raw_per_class_metrics = {}
+        smooth_macro_precision = 0.0
+        smooth_macro_recall = 0.0
+        smooth_macro_f1 = 0.0
+        smooth_micro_precision = 0.0
+        smooth_micro_recall = 0.0
+        smooth_micro_f1 = 0.0
+        smooth_per_class_metrics = {}
+        
+        if risk_level_ground_truth and raw_risk_labels:
+            # Filter out None values for smoothed labels
+            valid_indices = [i for i, lbl in enumerate(smoothed_risk_labels) if lbl is not None]
             
+            # Calculate raw metrics
+            raw_total = len(raw_risk_labels)
+            raw_correct = sum(1 for lbl in raw_risk_labels if lbl == risk_level_ground_truth)
+            raw_accuracy = raw_correct / raw_total if raw_total > 0 else 0.0
+            raw_errors = raw_total - raw_correct
+            
+            # Calculate smoothed metrics (only for valid frames)
+            smooth_total = len(valid_indices)
+            if smooth_total > 0:
+                smooth_labels_valid = [smoothed_risk_labels[i] for i in valid_indices]
+                raw_labels_valid = [raw_risk_labels[i] for i in valid_indices]
+                
+                smooth_correct = sum(1 for lbl in smooth_labels_valid if lbl == risk_level_ground_truth)
+                smooth_accuracy = smooth_correct / smooth_total if smooth_total > 0 else 0.0
+                smooth_errors = smooth_total - smooth_correct
+                
+                # Calculate b and c (McNemar test components)
+                b = sum(1 for i in range(len(valid_indices)) 
+                       if raw_labels_valid[i] != risk_level_ground_truth 
+                       and smooth_labels_valid[i] == risk_level_ground_truth)
+                c = sum(1 for i in range(len(valid_indices))
+                       if raw_labels_valid[i] == risk_level_ground_truth
+                       and smooth_labels_valid[i] != risk_level_ground_truth)
+                
+                # McNemar test
+                if (b + c) > 0:
+                    mcnemar_stat = (abs(b - c) - 1)**2 / (b + c)
+                    p_value = chi2.sf(mcnemar_stat, df=1)
+                    
+                    # Interpretation
+                    if np.isnan(p_value):
+                        interpretation = "No test (b+c=0)"
+                    elif p_value < 0.05:
+                        if b > c:
+                            interpretation = "Improved significantly"
+                        elif c > b:
+                            interpretation = "Worsened significantly"
+                        else:
+                            interpretation = "Changed significantly (tie)"
+                    else:
+                        interpretation = "No significant change"
+                else:
+                    interpretation = "No test (b+c=0)"
+            else:
+                smooth_accuracy = 0.0
+                smooth_correct = 0
+                smooth_errors = 0
+                interpretation = "No smoothed labels available"
+            
+            # Count predictions
+            for lbl in raw_risk_labels:
+                raw_prediction_counts[lbl] = raw_prediction_counts.get(lbl, 0) + 1
+            for lbl in smoothed_risk_labels:
+                if lbl is not None:
+                    smooth_prediction_counts[lbl] = smooth_prediction_counts.get(lbl, 0) + 1
+        
+        # Only create risk_level_metrics if we have ground truth
+        risk_level_metrics = None
+        if risk_level_ground_truth:
             risk_level_metrics = {
                 'ground_truth': risk_level_ground_truth,
                 'frames': total,
@@ -1068,7 +1422,7 @@ class IntegratedTrafficPerception:
                 'smooth_prediction_counts': smooth_prediction_counts,
                 'raw_most_common': max(raw_prediction_counts.items(), key=lambda x: x[1])[0] if raw_prediction_counts else None,
                 'smooth_most_common': max(smooth_prediction_counts.items(), key=lambda x: x[1])[0] if smooth_prediction_counts else None,
-                # Precision, Recall, F1 metrics
+                # Precision, Recall, F1 metrics (simplified - would need confusion matrix for proper calculation)
                 'raw_macro_precision': raw_macro_precision,
                 'raw_macro_recall': raw_macro_recall,
                 'raw_macro_f1': raw_macro_f1,
@@ -1137,6 +1491,8 @@ class IntegratedTrafficPerception:
         print(f"  Sign Model - Average time per frame: {avg_model_times['sign_model']:.4f} seconds ({avg_model_times['sign_model']*1000:.2f} ms)")
         print(f"  Signal Model - Average time per frame: {avg_model_times['signal_model']:.4f} seconds ({avg_model_times['signal_model']*1000:.2f} ms)")
         print(f"  Anomaly Model - Average time per frame: {avg_model_times['anomaly_model']:.4f} seconds ({avg_model_times['anomaly_model']*1000:.2f} ms)")
+        if 'risk_congestion_model' in avg_model_times:
+            print(f"  Risk & Congestion Model - Average time per frame: {avg_model_times['risk_congestion_model']:.4f} seconds ({avg_model_times['risk_congestion_model']*1000:.2f} ms)")
         # Performance metrics are suppressed here - they will be aggregated and printed
         # at the end of process_directory instead
         # (Metrics are still calculated and returned in the return dictionary)
@@ -1150,6 +1506,7 @@ class IntegratedTrafficPerception:
             signal_detections_by_class,
             sign_detections_by_class,
             anomaly_detections_by_class,
+            risk_congestion_detections_by_class,
             frame_count
         )
         
@@ -1192,6 +1549,50 @@ class IntegratedTrafficPerception:
                     writer.writeheader()
                     writer.writerows(csv_data)
                 
+                print(f"Saved integrated format detections CSV to: {csv_path}")
+            except Exception as e:
+                print(f"Warning: Failed to save integrated format CSV: {e}")
+        
+        # Save risk & congestion CSV in original format (matching demoidd_video_riskest_cong.py)
+        if risk_congestion_frame_data and output_path:
+            try:
+                # Determine output CSV path for original format
+                output_path_obj = Path(output_path)
+                if output_path_obj.is_dir():
+                    video_name = Path(video_path).stem
+                    csv_path_original = output_path_obj / f"{video_name}_result.csv"
+                else:
+                    video_name = Path(video_path).stem
+                    csv_path_original = output_path_obj.parent / f"{video_name}_result.csv"
+                
+                # Ensure parent directory exists
+                csv_path_original.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Create DataFrame matching original format
+                df = pd.DataFrame(risk_congestion_frame_data)
+                
+                # Ensure columns are in the correct order (matching original)
+                column_order = [
+                    'Frame Number',
+                    'c0', 'c1', 'c2', 'c3', 'c4',
+                    'a0', 'a1', 'a2', 'a3', 'a4',
+                    'd0', 'd1', 'd2', 'd3', 'd4',
+                    'b0', 'b1', 'b2', 'b3', 'b4',
+                    'pc_c0', 'pc_c1', 'pc_c2', 'pc_c3', 'pc_c4',
+                    'pc_p0', 'pc_p1', 'pc_p2', 'pc_p3', 'pc_p4',
+                    'B_sum', 'PCU_Sum', 'Raw Label', 'Smoothed Label'
+                ]
+                
+                # Reorder columns (only include columns that exist)
+                existing_columns = [col for col in column_order if col in df.columns]
+                df = df[existing_columns]
+                
+                # Save to CSV
+                df.to_csv(csv_path_original, index=False)
+                print(f"Saved original format risk/congestion CSV to: {csv_path_original}")
+            except Exception as e:
+                print(f"Warning: Failed to save original format CSV: {e}")
+                
                 print(f"\n{'='*70}")
                 print(f"Saved all detections to CSV: {csv_path}")
                 print(f"  Total detections: {len(all_detections_for_csv)}")
@@ -1209,7 +1610,8 @@ class IntegratedTrafficPerception:
             'elapsed_time': elapsed,
             'avg_frame_time': avg_frame_time,
             'avg_model_times': avg_model_times,
-            'metrics': metrics
+            'metrics': metrics,
+            'risk_level_metrics': risk_level_metrics
         }
     
     def process_directory(self, images_dir: str, output_dir: str = None, labels_dir: str = None,
@@ -1851,6 +2253,8 @@ class IntegratedTrafficPerception:
         print(f"  Sign Model - Average time per frame: {avg_model_times['sign_model']:.4f} seconds ({avg_model_times['sign_model']*1000:.2f} ms)")
         print(f"  Signal Model - Average time per frame: {avg_model_times['signal_model']:.4f} seconds ({avg_model_times['signal_model']*1000:.2f} ms)")
         print(f"  Anomaly Model - Average time per frame: {avg_model_times['anomaly_model']:.4f} seconds ({avg_model_times['anomaly_model']*1000:.2f} ms)")
+        if 'risk_congestion_model' in avg_model_times:
+            print(f"  Risk & Congestion Model - Average time per frame: {avg_model_times['risk_congestion_model']:.4f} seconds ({avg_model_times['risk_congestion_model']*1000:.2f} ms)")
         
         # Print performance metrics
         print(f"\nPERFORMANCE METRICS:")
