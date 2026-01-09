@@ -2,13 +2,13 @@
 Road Anomaly Detection Module (Potholes and Speedbumps)
 
 This module uses the same logic as speedbump_pothole_det/detect.py for detecting road anomalies.
-It supports both YOLOv5 (using DetectMultiBackend) and YOLOv8 (using ultralytics).
+It supports both YOLOv5 (using torch.hub) and YOLOv8 (using ultralytics).
 The module detects:
 - Potholes
 - Speedbumps
 
-Note: YOLOv5 with DetectMultiBackend is preferred to match the original detect.py logic.
-YOLOv8 is available as an alternative.
+Note: YOLOv8 is preferred for best performance.
+YOLOv5 is available as a fallback.
 
 Author: Integrated Traffic Perception System
 """
@@ -20,30 +20,6 @@ from pathlib import Path, WindowsPath
 import os
 import sys
 import pickle
-
-# Try to import YOLOv5 utilities from signal_det directory (same as detect.py uses)
-signal_det_path = Path(__file__).parent.parent / 'signal_det' / 'signal_det'
-DetectMultiBackend = None
-select_device = None
-non_max_suppression = None
-scale_boxes = None
-check_img_size = None
-
-if signal_det_path.exists():
-    if str(signal_det_path) not in sys.path:
-        sys.path.insert(0, str(signal_det_path))
-    
-    try:
-        from models.common import DetectMultiBackend
-        from utils.torch_utils import select_device
-        from utils.general import non_max_suppression, scale_boxes, check_img_size
-    except ImportError:
-        # Local YOLOv5 not available, will use fallback
-        DetectMultiBackend = None
-        select_device = None
-        non_max_suppression = None
-        scale_boxes = None
-        check_img_size = None
 
 # Try to import ultralytics YOLO (for YOLOv8)
 try:
@@ -192,30 +168,10 @@ class RoadAnomalyDetector:
                 print(f"  Found data.yaml at: {data_yaml_path}")
                 break
         
-        # Load model based on type - prioritize DetectMultiBackend for YOLOv5 (same as detect.py)
+        # Load model based on type
         model_loaded = False
         
-        # Method 1: For YOLOv5, try DetectMultiBackend first (same logic as detect.py)
-        if self.model_type == 'yolov5' and DetectMultiBackend and select_device:
-            try:
-                device_obj = select_device(device if device else '')
-                self.device = device_obj
-                # Use DetectMultiBackend with same parameters as detect.py
-                self.model = DetectMultiBackend(
-                    weights_path,
-                    device=device_obj,
-                    dnn=False,
-                    fp16=False,
-                    data=data_yaml_path if data_yaml_path else None
-                )
-                self.model.eval()
-                model_loaded = True
-                print("  ✓ Loaded using DetectMultiBackend (YOLOv5) - same as detect.py")
-            except Exception as e:
-                print(f"  ⚠ DetectMultiBackend loading failed: {e}")
-                print("  Trying torch.hub fallback...")
-        
-        # Method 2: For YOLOv8, try ultralytics YOLO
+        # Method 1: For YOLOv8, try ultralytics YOLO
         if not model_loaded and self.model_type == 'yolov8' and ULTRALYTICS_AVAILABLE:
             try:
                 self.model = UltralyticsYOLO(weights_path)
@@ -225,7 +181,7 @@ class RoadAnomalyDetector:
                 print(f"  ⚠ ultralytics YOLO loading failed: {e}")
                 print("  Trying torch.hub fallback...")
         
-        # Method 3: Fallback to torch.hub for YOLOv5 weights
+        # Method 2: Fallback to torch.hub for YOLOv5 weights
         if not model_loaded:
             try:
                 print("  Using torch.hub for YOLOv5 weights...")
@@ -251,7 +207,7 @@ class RoadAnomalyDetector:
             except Exception as e:
                 print(f"  ⚠ torch.hub loading failed: {e}")
                 print("  Trying Windows compatibility fix...")
-                # Method 4: Try loading with Windows PosixPath fix
+                # Method 3: Try loading with Windows PosixPath fix
                 try:
                     self.model = load_yolov5_weights_windows_fix(weights_path)
                     model_loaded = True
@@ -263,7 +219,7 @@ class RoadAnomalyDetector:
         if not model_loaded:
             raise RuntimeError(
                 f"Failed to load model from {weights_path}. "
-                "Tried DetectMultiBackend, ultralytics YOLO, and torch.hub. "
+                "Tried ultralytics YOLO and torch.hub. "
                 "Please check that the weights file is valid."
             )
         
@@ -310,7 +266,7 @@ class RoadAnomalyDetector:
         Detect road anomalies (potholes and speedbumps) in a video frame.
         
         This method uses the same logic as speedbump_pothole_det/detect.py:
-        - For YOLOv5: Uses DetectMultiBackend with proper preprocessing, NMS, and box scaling
+        - For YOLOv5: Uses torch.hub with proper preprocessing
         - For YOLOv8: Uses ultralytics YOLO
         
         Args:
@@ -328,67 +284,7 @@ class RoadAnomalyDetector:
         """
         detections = []
         
-        # Method 1: DetectMultiBackend (YOLOv5) - same logic as detect.py
-        if hasattr(self.model, 'stride') and non_max_suppression and scale_boxes:
-            try:
-                # Preprocess image - same as detect.py lines 186-191
-                im = torch.from_numpy(frame).to(self.model.device)
-                im = im.half() if self.model.fp16 else im.float()  # uint8 to fp16/32
-                im /= 255  # 0 - 255 to 0.0 - 1.0
-                if len(im.shape) == 3:
-                    im = im[None]  # expand for batch dim
-                
-                # Inference - same as detect.py line 207
-                pred = self.model(im, augment=False, visualize=False)
-                
-                # NMS - same as detect.py line 210
-                pred = non_max_suppression(pred, conf_threshold, iou_threshold, None, False, max_det=max_det)
-                
-                # Process predictions - same as detect.py lines 245-280
-                if len(pred) > 0 and len(pred[0]) > 0:
-                    det = pred[0]
-                    
-                    # Rescale boxes from img_size to im0 size - same as detect.py line 247
-                    det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], frame.shape).round()
-                    
-                    # Get class names from model
-                    names = self.model.names if hasattr(self.model, 'names') else self.classes
-                    if isinstance(names, dict):
-                        # Convert dict to list if needed
-                        max_class_id = max(names.keys()) if names else 0
-                        names_list = [names.get(i, f'class_{i}') for i in range(max_class_id + 1)]
-                    else:
-                        names_list = names if isinstance(names, list) else self.classes
-                    
-                    # Process each detection - same as detect.py lines 255-280
-                    for *xyxy, conf, cls in reversed(det):
-                        c = int(cls)  # integer class
-                        confidence = float(conf)
-                        
-                        # Get class name
-                        if c < len(names_list):
-                            class_name = names_list[c]
-                        elif c < len(self.classes):
-                            class_name = self.classes[c]
-                        else:
-                            class_name = f"anomaly_{c}"
-                        
-                        # Create detection dictionary
-                        detection = {
-                            'model_type': 'road_anomaly',
-                            'class_name': class_name,
-                            'confidence': confidence,
-                            'bbox': (int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3]))
-                        }
-                        
-                        detections.append(detection)
-                
-                return detections  # Successfully processed with DetectMultiBackend
-            except Exception as e:
-                print(f"  ⚠ DetectMultiBackend inference failed: {e}")
-                print("  Trying alternative methods...")
-        
-        # Method 2: Ultralytics YOLO format (YOLOv8)
+        # Method 1: Ultralytics YOLO format (YOLOv8)
         if hasattr(self.model, 'predict') and not hasattr(self.model, 'names'):
             try:
                 results = self.model.predict(frame, conf=conf_threshold, verbose=False)
@@ -433,7 +329,7 @@ class RoadAnomalyDetector:
             except Exception as e:
                 print(f"  ⚠ Ultralytics YOLO inference failed: {e}")
         
-        # Method 3: torch.hub YOLOv5 format (fallback)
+        # Method 2: torch.hub YOLOv5 format (fallback)
         if hasattr(self.model, 'names'):
             try:
                 results = self.model(frame)
