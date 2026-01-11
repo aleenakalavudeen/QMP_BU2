@@ -941,6 +941,18 @@ class IntegratedTrafficPerception:
             labels_dir (str): Optional path to directory containing ground truth label files (YOLO format) for metrics calculation
             iou_threshold (float): IoU threshold for matching predictions to ground truth (default: 0.5)
             conf_threshold (float): Confidence threshold for predictions (default: 0.4)
+        
+        Returns:
+            dict: Processing results containing:
+                - frame_count (int): Total number of frames processed
+                - elapsed_time (float): Total elapsed time in seconds
+                - avg_frame_time (float): Average processing time per frame in seconds
+                - avg_model_times (dict): Average processing times per model (seconds)
+                - frame_times (list[float]): Per-frame processing times in seconds
+                - model_times_per_frame (list[dict]): Per-frame model times. Each dict contains:
+                    {'sign_model': float, 'signal_model': float, 'anomaly_model': float, 'risk_congestion_model': float}
+                - metrics (dict): Detection metrics if labels provided
+                - risk_level_metrics (dict): Risk level metrics if available
         """
         print(f"\nProcessing video: {video_path}")
         
@@ -1528,9 +1540,21 @@ class IntegratedTrafficPerception:
                 for item in all_detections_for_csv:
                     det = item['detection']
                     x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
+                    
+                    # Get timing for this frame
+                    frame_idx = item['frame_number'] - 1  # Convert to 0-indexed
+                    frame_time = frame_times[frame_idx] if frame_idx < len(frame_times) and frame_idx >= 0 else 0.0
+                    model_times = model_times_list[frame_idx] if frame_idx < len(model_times_list) and frame_idx >= 0 else {}
+                    
                     row = {
                         'Source': item['source_name'],
                         'Frame': item['frame_number'],
+                        'Processing Time (s)': f"{frame_time:.6f}",
+                        'Processing Time (ms)': f"{frame_time * 1000:.3f}",
+                        'Sign Model Time (ms)': f"{model_times.get('sign_model', 0.0) * 1000:.3f}",
+                        'Signal Model Time (ms)': f"{model_times.get('signal_model', 0.0) * 1000:.3f}",
+                        'Anomaly Model Time (ms)': f"{model_times.get('anomaly_model', 0.0) * 1000:.3f}",
+                        'Risk Congestion Model Time (ms)': f"{model_times.get('risk_congestion_model', 0.0) * 1000:.3f}",
                         'Model Type': det.get('model_type', 'unknown'),
                         'Class Name': det.get('class_name', 'unknown'),
                         'Confidence': f"{det.get('confidence', 0.0):.4f}",
@@ -1542,7 +1566,10 @@ class IntegratedTrafficPerception:
                     csv_data.append(row)
                 
                 # Write to CSV
-                fieldnames = ['Source', 'Frame', 'Model Type', 'Class Name', 'Confidence', 
+                fieldnames = ['Source', 'Frame', 'Processing Time (s)', 'Processing Time (ms)',
+                             'Sign Model Time (ms)', 'Signal Model Time (ms)',
+                             'Anomaly Model Time (ms)', 'Risk Congestion Model Time (ms)',
+                             'Model Type', 'Class Name', 'Confidence', 
                              'Bbox X1', 'Bbox Y1', 'Bbox X2', 'Bbox Y2']
                 with open(csv_path, mode='w', newline='') as f:
                     writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -1610,6 +1637,8 @@ class IntegratedTrafficPerception:
             'elapsed_time': elapsed,
             'avg_frame_time': avg_frame_time,
             'avg_model_times': avg_model_times,
+            'frame_times': frame_times,  # Per-frame processing times (list of floats in seconds)
+            'model_times_per_frame': model_times_list,  # Per-frame model times (list of dicts)
             'metrics': metrics,
             'risk_level_metrics': risk_level_metrics
         }
