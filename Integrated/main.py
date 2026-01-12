@@ -1535,6 +1535,9 @@ class IntegratedTrafficPerception:
                 # Ensure parent directory exists
                 csv_path.parent.mkdir(parents=True, exist_ok=True)
                 
+                # Check if CSV file already exists (for directory processing)
+                csv_exists = csv_path.is_file()
+                
                 # Prepare CSV data
                 csv_data = []
                 for item in all_detections_for_csv:
@@ -1571,9 +1574,14 @@ class IntegratedTrafficPerception:
                              'Anomaly Model Time (ms)', 'Risk Congestion Model Time (ms)',
                              'Model Type', 'Class Name', 'Confidence', 
                              'Bbox X1', 'Bbox Y1', 'Bbox X2', 'Bbox Y2']
-                with open(csv_path, mode='w', newline='') as f:
+                
+                # Use append mode if file exists (for directory processing), write mode otherwise
+                mode = 'a' if csv_exists else 'w'
+                with open(csv_path, mode=mode, newline='') as f:
                     writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
+                    # Only write header if file doesn't exist
+                    if not csv_exists:
+                        writer.writeheader()
                     writer.writerows(csv_data)
                 
                 print(f"Saved integrated format detections CSV to: {csv_path}")
