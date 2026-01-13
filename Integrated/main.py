@@ -413,6 +413,277 @@ class IntegratedTrafficPerception:
         
         return results
     
+    def benchmark_parallel_performance(self, source: str, max_frames: int = None, conf_threshold: float = 0.25) -> Dict:
+        """
+        Benchmark parallel vs sequential processing performance using total final time.
+        
+        Processes a video or multiple frames with parallel processing on and off,
+        then calculates the percentage reduction in total computational time and per-frame time.
+        
+        Args:
+            source (str): Path to video file, image directory, or single image
+            max_frames (int, optional): Maximum number of frames to process (for testing, default: None = all frames)
+            conf_threshold (float): Confidence threshold for detections (default: 0.25)
+        
+        Returns:
+            dict: Benchmark results containing:
+                - parallel_total_time: Total time with parallel processing (seconds)
+                - sequential_total_time: Total time with sequential processing (seconds)
+                - time_reduction: Absolute time reduction (seconds)
+                - percentage_reduction_total: Percentage reduction in total computational time
+                - percentage_reduction_per_frame: Percentage reduction in per-frame computational time
+                - speedup_factor: Speedup factor (sequential_time / parallel_time)
+                - frames_processed: Number of frames processed
+                - parallel_avg_frame_time: Average time per frame with parallel processing
+                - sequential_avg_frame_time: Average time per frame with sequential processing
+        """
+        print("\n" + "="*70)
+        print("BENCHMARKING PARALLEL vs SEQUENTIAL PROCESSING")
+        print("="*70)
+        print(f"Source: {source}")
+        if max_frames:
+            print(f"Processing up to {max_frames} frames for each mode...")
+        else:
+            print("Processing all frames for each mode...")
+        print()
+        
+        source_path = Path(source)
+        if not source_path.exists():
+            script_dir = Path(__file__).parent
+            alt_path = script_dir / source
+            if alt_path.exists():
+                source_path = alt_path
+            else:
+                project_root = Path(__file__).parent.parent
+                alt_path2 = project_root / source
+                if alt_path2.exists():
+                    source_path = alt_path2
+                else:
+                    raise ValueError(f"Source not found: {source}")
+        
+        # Determine if source is video, directory, or single image
+        video_extensions = {'.mp4', '.avi', '.mov', '.mkv', '.webm'}
+        image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+        
+        frames_to_process = []
+        
+        if source_path.is_dir():
+            # Load all images from directory
+            image_files = []
+            for ext in image_extensions:
+                image_files.extend(list(source_path.glob(f'*{ext}')))
+                image_files.extend(list(source_path.glob(f'*{ext.upper()}')))
+            
+            if not image_files:
+                raise ValueError(f"No image files found in directory: {source_path}")
+            
+            image_files.sort()
+            if max_frames:
+                image_files = image_files[:max_frames]
+            
+            print(f"Loading {len(image_files)} images...")
+            for img_path in image_files:
+                frame = cv2.imread(str(img_path))
+                if frame is not None:
+                    frames_to_process.append(frame)
+            
+            if not frames_to_process:
+                raise ValueError(f"Could not load any images from: {source_path}")
+        
+        elif source_path.suffix.lower() in video_extensions:
+            # Load frames from video
+            cap = cv2.VideoCapture(str(source_path))
+            if not cap.isOpened():
+                raise ValueError(f"Could not open video: {source_path}")
+            
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            print(f"Video: {total_frames} frames @ {fps} FPS")
+            
+            frame_count = 0
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                frames_to_process.append(frame)
+                frame_count += 1
+                
+                if max_frames and frame_count >= max_frames:
+                    break
+            
+            cap.release()
+            
+            if not frames_to_process:
+                raise ValueError(f"Could not read any frames from video: {source_path}")
+        
+        elif source_path.suffix.lower() in image_extensions:
+            # Single image - process it multiple times for better comparison
+            frame = cv2.imread(str(source_path))
+            if frame is None:
+                raise ValueError(f"Could not load image: {source_path}")
+            
+            # Use the image multiple times (default 10 iterations for single image)
+            num_iterations = max_frames if max_frames else 10
+            frames_to_process = [frame] * num_iterations
+            print(f"Using single image with {num_iterations} iterations...")
+        
+        else:
+            raise ValueError(f"Unsupported file type: {source_path.suffix}")
+        
+        total_frames = len(frames_to_process)
+        print(f"Total frames to process: {total_frames}")
+        print()
+        
+        # Benchmark with parallel processing ON
+        print("="*70)
+        print("Testing with PARALLEL processing ON...")
+        print("="*70)
+        parallel_start_time = time.time()
+        parallel_frame_times = []
+        
+        for i, frame in enumerate(frames_to_process):
+            frame_id = i + 1 if source_path.suffix.lower() in video_extensions else None
+            frame_start = time.time()
+            self.process_frame(frame, use_parallel=True, conf_threshold=conf_threshold, frame_id=frame_id)
+            frame_time = time.time() - frame_start
+            parallel_frame_times.append(frame_time)
+            
+            if (i + 1) % max(1, total_frames // 10) == 0 or (i + 1) == total_frames:
+                print(f"  Processed {i + 1}/{total_frames} frames...")
+        
+        parallel_total_time = time.time() - parallel_start_time
+        parallel_avg_frame_time = parallel_total_time / total_frames
+        
+        print(f"  Total time: {parallel_total_time:.4f}s")
+        print(f"  Average per frame: {parallel_avg_frame_time:.4f}s")
+        print()
+        
+        # Benchmark with parallel processing OFF
+        print("="*70)
+        print("Testing with PARALLEL processing OFF (sequential)...")
+        print("="*70)
+        sequential_start_time = time.time()
+        sequential_frame_times = []
+        
+        for i, frame in enumerate(frames_to_process):
+            frame_id = i + 1 if source_path.suffix.lower() in video_extensions else None
+            frame_start = time.time()
+            self.process_frame(frame, use_parallel=False, conf_threshold=conf_threshold, frame_id=frame_id)
+            frame_time = time.time() - frame_start
+            sequential_frame_times.append(frame_time)
+            
+            if (i + 1) % max(1, total_frames // 10) == 0 or (i + 1) == total_frames:
+                print(f"  Processed {i + 1}/{total_frames} frames...")
+        
+        sequential_total_time = time.time() - sequential_start_time
+        sequential_avg_frame_time = sequential_total_time / total_frames
+        
+        print(f"  Total time: {sequential_total_time:.4f}s")
+        print(f"  Average per frame: {sequential_avg_frame_time:.4f}s")
+        print()
+        
+        # Calculate metrics
+        time_reduction_total = sequential_total_time - parallel_total_time
+        time_reduction_per_frame = sequential_avg_frame_time - parallel_avg_frame_time
+        
+        percentage_reduction_total = (time_reduction_total / sequential_total_time) * 100 if sequential_total_time > 0 else 0
+        percentage_reduction_per_frame = (time_reduction_per_frame / sequential_avg_frame_time) * 100 if sequential_avg_frame_time > 0 else 0
+        
+        speedup_factor = sequential_total_time / parallel_total_time if parallel_total_time > 0 else 1.0
+        
+        # Display results
+        print("="*70)
+        print("BENCHMARK RESULTS")
+        print("="*70)
+        print(f"Frames Processed:                    {total_frames}")
+        print()
+        print("TOTAL TIME METRICS:")
+        print(f"  Parallel Total Time:               {parallel_total_time:.4f}s")
+        print(f"  Sequential Total Time:             {sequential_total_time:.4f}s")
+        print(f"  Total Time Reduction:              {time_reduction_total:.4f}s")
+        print(f"  Percentage Reduction (Total):      {percentage_reduction_total:.2f}%")
+        print()
+        print("PER-FRAME METRICS:")
+        print(f"  Parallel Avg Time/Frame:           {parallel_avg_frame_time:.4f}s")
+        print(f"  Sequential Avg Time/Frame:         {sequential_avg_frame_time:.4f}s")
+        print(f"  Per-Frame Time Reduction:          {time_reduction_per_frame:.4f}s")
+        print(f"  Percentage Reduction (Per-Frame):  {percentage_reduction_per_frame:.2f}%")
+        print()
+        print("OVERALL METRICS:")
+        print(f"  Speedup Factor:                   {speedup_factor:.2f}x")
+        print("="*70)
+        print()
+        
+        return {
+            'parallel_total_time': parallel_total_time,
+            'sequential_total_time': sequential_total_time,
+            'time_reduction_total': time_reduction_total,
+            'time_reduction_per_frame': time_reduction_per_frame,
+            'percentage_reduction_total': percentage_reduction_total,
+            'percentage_reduction_per_frame': percentage_reduction_per_frame,
+            'speedup_factor': speedup_factor,
+            'frames_processed': total_frames,
+            'parallel_avg_frame_time': parallel_avg_frame_time,
+            'sequential_avg_frame_time': sequential_avg_frame_time,
+            'parallel_frame_times': parallel_frame_times,
+            'sequential_frame_times': sequential_frame_times,
+            'source': str(source_path)
+        }
+    
+    def _save_benchmark_to_csv(self, benchmark_results: Dict, output_path: Path):
+        """
+        Save benchmark results to CSV file.
+        
+        Args:
+            benchmark_results: Dictionary containing benchmark results
+            output_path: Path object for the output CSV file
+        """
+        try:
+            # Ensure parent directory exists
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Prepare CSV data
+            row = {
+                'Source': benchmark_results.get('source', ''),
+                'Frames Processed': benchmark_results.get('frames_processed', 0),
+                'Parallel Total Time (s)': f"{benchmark_results.get('parallel_total_time', 0.0):.6f}",
+                'Sequential Total Time (s)': f"{benchmark_results.get('sequential_total_time', 0.0):.6f}",
+                'Total Time Reduction (s)': f"{benchmark_results.get('time_reduction_total', 0.0):.6f}",
+                'Percentage Reduction Total (%)': f"{benchmark_results.get('percentage_reduction_total', 0.0):.2f}",
+                'Parallel Avg Time Per Frame (s)': f"{benchmark_results.get('parallel_avg_frame_time', 0.0):.6f}",
+                'Sequential Avg Time Per Frame (s)': f"{benchmark_results.get('sequential_avg_frame_time', 0.0):.6f}",
+                'Per-Frame Time Reduction (s)': f"{benchmark_results.get('time_reduction_per_frame', 0.0):.6f}",
+                'Percentage Reduction Per-Frame (%)': f"{benchmark_results.get('percentage_reduction_per_frame', 0.0):.2f}",
+                'Speedup Factor (x)': f"{benchmark_results.get('speedup_factor', 1.0):.2f}",
+                'Timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            # Write to CSV
+            fieldnames = [
+                'Source', 'Frames Processed',
+                'Parallel Total Time (s)', 'Sequential Total Time (s)', 'Total Time Reduction (s)', 'Percentage Reduction Total (%)',
+                'Parallel Avg Time Per Frame (s)', 'Sequential Avg Time Per Frame (s)', 'Per-Frame Time Reduction (s)', 'Percentage Reduction Per-Frame (%)',
+                'Speedup Factor (x)', 'Timestamp'
+            ]
+            
+            file_exists = output_path.is_file()
+            
+            mode = 'a' if file_exists else 'w'
+            with open(output_path, mode=mode, newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(row)
+            
+            print(f"Benchmark results saved to: {output_path}")
+            return True
+        except Exception as e:
+            print(f"Error saving benchmark results to CSV: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+    
     def _save_detections_to_csv(self, detections: List[Dict], source_name: str, output_path: Path, 
                                 append: bool = False, frame_number: int = None):
         """
@@ -1744,6 +2015,7 @@ class IntegratedTrafficPerception:
         # Collect metrics from all videos for aggregation
         all_video_metrics = []  # List of metrics dicts from each video
         all_per_model_metrics = {}  # Aggregated per-model metrics
+        all_video_results = []  # Store all video results (including timing data)
         
         for file in files_to_process:
             print(f"\nProcessing: {file.name}")
@@ -1774,8 +2046,10 @@ class IntegratedTrafficPerception:
                     
                     if output_file:
                         print(f"  ✓ Saved to: {output_file}")
-                    if result and 'metrics' in result:
+                    if result:
                         print(f"  Frames processed: {result.get('frame_count', 'N/A')}")
+                        # Store full result for timing aggregation
+                        all_video_results.append(result)
                         # Collect metrics for aggregation
                         if result.get('metrics'):
                             all_video_metrics.append(result['metrics'])
@@ -1893,6 +2167,152 @@ class IntegratedTrafficPerception:
             print("PERFORMANCE METRICS:")
             print(f"  (No ground truth labels found - precision/recall/F1/accuracy not calculated)")
             print(f"{'='*70}")
+        
+        # Aggregate and print overall timing metrics for videos
+        overall_timing_data = None
+        if is_video and all_video_results:
+            print(f"\n{'='*70}")
+            print("OVERALL TIMING METRICS (Aggregated across all videos)")
+            print(f"{'='*70}")
+            
+            # Aggregate timing data across all videos
+            total_frames = sum(r.get('frame_count', 0) for r in all_video_results)
+            total_elapsed_time = sum(r.get('elapsed_time', 0.0) for r in all_video_results)
+            
+            # Calculate overall average frame time (weighted by frame count)
+            if total_frames > 0:
+                overall_avg_frame_time = total_elapsed_time / total_frames
+            else:
+                overall_avg_frame_time = 0.0
+            
+            # Aggregate model times across all videos
+            overall_avg_model_times = {
+                'sign_model': 0.0,
+                'signal_model': 0.0,
+                'anomaly_model': 0.0,
+                'risk_congestion_model': 0.0
+            }
+            
+            # Collect all model times from all videos
+            all_model_times = {
+                'sign_model': [],
+                'signal_model': [],
+                'anomaly_model': [],
+                'risk_congestion_model': []
+            }
+            
+            for result in all_video_results:
+                avg_model_times = result.get('avg_model_times', {})
+                for model_name in all_model_times.keys():
+                    if model_name in avg_model_times and avg_model_times[model_name] > 0:
+                        # Get frame count for this video to weight the average
+                        frame_count = result.get('frame_count', 0)
+                        if frame_count > 0:
+                            # Add the average time for each frame in this video
+                            all_model_times[model_name].extend([avg_model_times[model_name]] * frame_count)
+            
+            # Calculate overall averages
+            for model_name in overall_avg_model_times.keys():
+                if all_model_times[model_name]:
+                    overall_avg_model_times[model_name] = sum(all_model_times[model_name]) / len(all_model_times[model_name])
+            
+            print(f"\nTIMING METRICS (Videos):")
+            print(f"  Integrated Model - Average time per frame: {overall_avg_frame_time:.4f} seconds ({overall_avg_frame_time*1000:.2f} ms)")
+            print(f"  Sign Model - Average time per frame: {overall_avg_model_times['sign_model']:.4f} seconds ({overall_avg_model_times['sign_model']*1000:.2f} ms)")
+            print(f"  Signal Model - Average time per frame: {overall_avg_model_times['signal_model']:.4f} seconds ({overall_avg_model_times['signal_model']*1000:.2f} ms)")
+            print(f"  Anomaly Model - Average time per frame: {overall_avg_model_times['anomaly_model']:.4f} seconds ({overall_avg_model_times['anomaly_model']*1000:.2f} ms)")
+            if overall_avg_model_times.get('risk_congestion_model', 0.0) > 0:
+                print(f"  Risk & Congestion Model - Average time per frame: {overall_avg_model_times['risk_congestion_model']:.4f} seconds ({overall_avg_model_times['risk_congestion_model']*1000:.2f} ms)")
+            
+            print(f"\nTotal frames processed: {total_frames}")
+            print(f"Total processing time: {total_elapsed_time:.2f} seconds")
+            avg_fps = total_frames / total_elapsed_time if total_elapsed_time > 0 else 0.0
+            print(f"Average processing FPS: {avg_fps:.2f}")
+            
+            # Store timing data for CSV export
+            overall_timing_data = {
+                'total_frames': total_frames,
+                'total_processing_time_seconds': total_elapsed_time,
+                'average_processing_fps': avg_fps,
+                'integrated_model_avg_time_per_frame_seconds': overall_avg_frame_time,
+                'integrated_model_avg_time_per_frame_ms': overall_avg_frame_time * 1000,
+                'sign_model_avg_time_per_frame_seconds': overall_avg_model_times['sign_model'],
+                'sign_model_avg_time_per_frame_ms': overall_avg_model_times['sign_model'] * 1000,
+                'signal_model_avg_time_per_frame_seconds': overall_avg_model_times['signal_model'],
+                'signal_model_avg_time_per_frame_ms': overall_avg_model_times['signal_model'] * 1000,
+                'anomaly_model_avg_time_per_frame_seconds': overall_avg_model_times['anomaly_model'],
+                'anomaly_model_avg_time_per_frame_ms': overall_avg_model_times['anomaly_model'] * 1000,
+                'risk_congestion_model_avg_time_per_frame_seconds': overall_avg_model_times.get('risk_congestion_model', 0.0),
+                'risk_congestion_model_avg_time_per_frame_ms': overall_avg_model_times.get('risk_congestion_model', 0.0) * 1000
+            }
+        
+        # Save overall results to CSV
+        if is_video and output_path:
+            try:
+                final_results_path = Path(output_path) / "final_results.csv"
+                final_results_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                # Prepare data for CSV
+                csv_rows = []
+                
+                # Add overall timing metrics
+                if overall_timing_data:
+                    row = {
+                        'Metric_Type': 'Overall_Timing',
+                        'Total_Frames': overall_timing_data['total_frames'],
+                        'Total_Processing_Time_Seconds': f"{overall_timing_data['total_processing_time_seconds']:.2f}",
+                        'Average_Processing_FPS': f"{overall_timing_data['average_processing_fps']:.2f}",
+                        'Integrated_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['integrated_model_avg_time_per_frame_seconds']:.4f}",
+                        'Integrated_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['integrated_model_avg_time_per_frame_ms']:.2f}",
+                        'Sign_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['sign_model_avg_time_per_frame_seconds']:.4f}",
+                        'Sign_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['sign_model_avg_time_per_frame_ms']:.2f}",
+                        'Signal_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['signal_model_avg_time_per_frame_seconds']:.4f}",
+                        'Signal_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['signal_model_avg_time_per_frame_ms']:.2f}",
+                        'Anomaly_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['anomaly_model_avg_time_per_frame_seconds']:.4f}",
+                        'Anomaly_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['anomaly_model_avg_time_per_frame_ms']:.2f}",
+                        'Risk_Congestion_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['risk_congestion_model_avg_time_per_frame_seconds']:.4f}",
+                        'Risk_Congestion_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['risk_congestion_model_avg_time_per_frame_ms']:.2f}"
+                    }
+                    csv_rows.append(row)
+                
+                # Add overall performance metrics if available
+                if all_video_metrics and overall_precision is not None:
+                    row = {
+                        'Metric_Type': 'Overall_Performance',
+                        'Total_TP': total_tp_all,
+                        'Total_FP': total_fp_all,
+                        'Total_FN': total_fn_all,
+                        'Precision': f"{overall_precision:.4f}",
+                        'Recall': f"{overall_recall:.4f}",
+                        'F1_Score': f"{overall_f1:.4f}",
+                        'Accuracy': f"{overall_accuracy:.4f}",
+                        'Total_Frames': '',
+                        'Total_Processing_Time_Seconds': '',
+                        'Average_Processing_FPS': '',
+                        'Integrated_Model_Avg_Time_Per_Frame_Seconds': '',
+                        'Integrated_Model_Avg_Time_Per_Frame_Ms': '',
+                        'Sign_Model_Avg_Time_Per_Frame_Seconds': '',
+                        'Sign_Model_Avg_Time_Per_Frame_Ms': '',
+                        'Signal_Model_Avg_Time_Per_Frame_Seconds': '',
+                        'Signal_Model_Avg_Time_Per_Frame_Ms': '',
+                        'Anomaly_Model_Avg_Time_Per_Frame_Seconds': '',
+                        'Anomaly_Model_Avg_Time_Per_Frame_Ms': '',
+                        'Risk_Congestion_Model_Avg_Time_Per_Frame_Seconds': '',
+                        'Risk_Congestion_Model_Avg_Time_Per_Frame_Ms': ''
+                    }
+                    csv_rows.append(row)
+                
+                # Write to CSV
+                if csv_rows:
+                    df = pd.DataFrame(csv_rows)
+                    df.to_csv(final_results_path, index=False)
+                    print(f"\n{'='*70}")
+                    print(f"Overall results saved to: {final_results_path}")
+                    print(f"{'='*70}")
+            except Exception as e:
+                print(f"\nWarning: Failed to save final results CSV: {e}")
+                import traceback
+                traceback.print_exc()
         
         print(f"{'='*70}")
         
@@ -2612,13 +3032,33 @@ def main():
         '--device',
         type=str,
         default='auto',
-        help='Device to run models on: cpu, cuda/gpu, or auto (default: auto)'
+        help='Device to run models on: cpu, cuda/gpu, cuda:0, cuda:1, etc., or auto (default: auto)'
     )
     
     parser.add_argument(
         '--no-parallel',
         action='store_true',
         help='Disable parallel processing of models (run sequentially instead)'
+    )
+    
+    parser.add_argument(
+        '--benchmark-parallel',
+        action='store_true',
+        help='Benchmark parallel vs sequential processing performance using total final time'
+    )
+    
+    parser.add_argument(
+        '--benchmark-frames',
+        type=int,
+        default=None,
+        help='Maximum number of frames to process during benchmark (default: all frames)'
+    )
+    
+    parser.add_argument(
+        '--benchmark-output',
+        type=str,
+        default=None,
+        help='Path to save benchmark results CSV file (default: benchmark_results.csv in current directory)'
     )
     
     parser.add_argument(
@@ -2743,6 +3183,9 @@ def main():
         name = device_arg.lower()
         if name == 'gpu':
             return 'cuda'
+        # Support cuda:0, cuda:1, etc. (keep original case for torch.device)
+        if name.startswith('cuda:'):
+            return device_arg  # Keep original to preserve GPU ID
         if name in ('cuda', 'cpu'):
             return name
         print(f"Warning: Unknown device '{device_arg}' - defaulting to auto.")
@@ -2772,6 +3215,38 @@ def main():
             return metrics
         except Exception as e:
             print(f"Error during evaluation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    # If benchmark mode, run benchmark and exit
+    if args.benchmark_parallel:
+        try:
+            # Use the source argument for benchmark
+            if args.source.lower() == 'webcam':
+                print("Error: Cannot benchmark with webcam. Please provide a video file, image directory, or single image.")
+                return None
+            
+            # Run benchmark
+            benchmark_results = pipeline.benchmark_parallel_performance(
+                source=args.source,
+                max_frames=args.benchmark_frames,
+                conf_threshold=args.conf_threshold
+            )
+            
+            # Save to CSV
+            if args.benchmark_output:
+                output_path = Path(args.benchmark_output)
+            else:
+                # Default: save to benchmark_results.csv in current directory
+                output_path = Path('benchmark_results.csv')
+            
+            pipeline._save_benchmark_to_csv(benchmark_results, output_path)
+            
+            # Return results for potential script usage
+            return benchmark_results
+        except Exception as e:
+            print(f"Error during benchmarking: {e}")
             import traceback
             traceback.print_exc()
             return None
