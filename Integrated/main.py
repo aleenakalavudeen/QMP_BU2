@@ -160,6 +160,13 @@ class IntegratedTrafficPerception:
         
         # Initialize tracking for individual model outputs
         self._init_output_tracking()
+        
+        # Create separate thread pools for each model (1 thread each for sequential mode)
+        # This ensures fair comparison: same total thread capacity (4 threads) as parallel mode
+        self.sign_executor = ThreadPoolExecutor(max_workers=1) if self.sign_detector else None
+        self.signal_executor = ThreadPoolExecutor(max_workers=1) if self.signal_detector else None
+        self.anomaly_executor = ThreadPoolExecutor(max_workers=1) if self.road_detector else None
+        self.risk_congestion_executor = ThreadPoolExecutor(max_workers=1) if self.risk_congestion_detector else None
     
     def _detect_sign_impl(self, frame: np.ndarray) -> List[Dict]:
         """Internal implementation for sign detection."""
@@ -227,6 +234,17 @@ class IntegratedTrafficPerception:
         self.risk_congestion_detections_by_class = {}  # class_name -> count
         self.risk_metrics_history = []  # Store risk metrics over time
         self.congestion_metrics_history = []  # Store congestion metrics over time
+    
+    def cleanup(self):
+        """Shutdown all thread pools."""
+        if hasattr(self, 'sign_executor') and self.sign_executor:
+            self.sign_executor.shutdown(wait=True)
+        if hasattr(self, 'signal_executor') and self.signal_executor:
+            self.signal_executor.shutdown(wait=True)
+        if hasattr(self, 'anomaly_executor') and self.anomaly_executor:
+            self.anomaly_executor.shutdown(wait=True)
+        if hasattr(self, 'risk_congestion_executor') and self.risk_congestion_executor:
+            self.risk_congestion_executor.shutdown(wait=True)
         
     
     def process_frame(self, frame: np.ndarray, use_parallel: bool = None, conf_threshold: float = 0.25, frame_id: Optional[int] = None) -> Dict:
@@ -331,31 +349,56 @@ class IntegratedTrafficPerception:
                         elif model_name == 'risk_congestion':
                             risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
         else:
-            # Sequential processing (fallback or when parallel disabled)
+            # Sequential processing (models run one after another, each model uses 1 thread)
+            # Total thread capacity: 4 threads (1 per model), same as parallel mode for fair comparison
             if self.sign_detector:
                 sign_start = time.time()
-                sign_detections = self._detect_sign_threadsafe(frame)
+                try:
+                    # Use sign model's 1-thread pool
+                    future = self.sign_executor.submit(self._detect_sign_threadsafe, frame)
+                    sign_detections = future.result()
+                except Exception as e:
+                    print(f"Warning: Error in sign detection: {e}")
+                    sign_detections = []
                 model_times['sign_model'] = time.time() - sign_start
             else:
                 sign_detections = []
             
             if self.signal_detector:
                 signal_start = time.time()
-                signal_detections = self._detect_signal_threadsafe(frame, conf_threshold=conf_threshold)
+                try:
+                    # Use signal model's 1-thread pool
+                    future = self.signal_executor.submit(self._detect_signal_threadsafe, frame, conf_threshold)
+                    signal_detections = future.result()
+                except Exception as e:
+                    print(f"Warning: Error in signal detection: {e}")
+                    signal_detections = []
                 model_times['signal_model'] = time.time() - signal_start
             else:
                 signal_detections = []
             
             if self.road_detector:
                 anomaly_start = time.time()
-                anomaly_detections = self._detect_anomaly_threadsafe(frame)
+                try:
+                    # Use anomaly model's 1-thread pool
+                    future = self.anomaly_executor.submit(self._detect_anomaly_threadsafe, frame)
+                    anomaly_detections = future.result()
+                except Exception as e:
+                    print(f"Warning: Error in anomaly detection: {e}")
+                    anomaly_detections = []
                 model_times['anomaly_model'] = time.time() - anomaly_start
             else:
                 anomaly_detections = []
             
             if self.risk_congestion_detector:
                 risk_congestion_start = time.time()
-                risk_congestion_results = self._detect_risk_congestion_threadsafe(frame, frame_id=frame_id)
+                try:
+                    # Use risk_congestion model's 1-thread pool
+                    future = self.risk_congestion_executor.submit(self._detect_risk_congestion_threadsafe, frame, frame_id)
+                    risk_congestion_results = future.result()
+                except Exception as e:
+                    print(f"Warning: Error in risk_congestion detection: {e}")
+                    risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
                 model_times['risk_congestion_model'] = time.time() - risk_congestion_start
             else:
                 risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
@@ -468,27 +511,81 @@ class IntegratedTrafficPerception:
         frames_to_process = []
         
         if source_path.is_dir():
-            # Load all images from directory
-            image_files = []
-            for ext in image_extensions:
-                image_files.extend(list(source_path.glob(f'*{ext}')))
-                image_files.extend(list(source_path.glob(f'*{ext.upper()}')))
+            # Check for both images and videos in directory
+            image_files = [f for f in source_path.rglob('*') 
+                          if f.is_file() and f.suffix.lower() in image_extensions]
+            video_files = [f for f in source_path.rglob('*') 
+                          if f.is_file() and f.suffix.lower() in video_extensions]
             
-            if not image_files:
-                raise ValueError(f"No image files found in directory: {source_path}")
+            # Determine what to process (prefer images if both exist)
+            if image_files and video_files:
+                print(f"Warning: Found both images ({len(image_files)}) and videos ({len(video_files)}) in directory.")
+                print(f"Processing images only for benchmarking.")
+                files_to_process = sorted(image_files)
+                is_video = False
+            elif image_files:
+                files_to_process = sorted(image_files)
+                is_video = False
+            elif video_files:
+                files_to_process = sorted(video_files)
+                is_video = True
+            else:
+                raise ValueError(f"No image or video files found in directory: {source_path}\n"
+                               f"Supported image formats: {image_extensions}\n"
+                               f"Supported video formats: {video_extensions}")
             
-            image_files.sort()
-            if max_frames:
-                image_files = image_files[:max_frames]
-            
-            print(f"Loading {len(image_files)} images...")
-            for img_path in image_files:
-                frame = cv2.imread(str(img_path))
-                if frame is not None:
-                    frames_to_process.append(frame)
-            
-            if not frames_to_process:
-                raise ValueError(f"Could not load any images from: {source_path}")
+            if is_video:
+                # Load frames from all videos in directory (for consistency with normal processing)
+                videos_to_process = files_to_process
+                if max_frames is None:
+                    print(f"Loading frames from {len(videos_to_process)} video(s)...")
+                else:
+                    print(f"Loading frames from {len(videos_to_process)} video(s) (up to {max_frames} frames total)...")
+                
+                for video_path in videos_to_process:
+                    print(f"  Loading frames from video: {video_path.name}...")
+                    cap = cv2.VideoCapture(str(video_path))
+                    if not cap.isOpened():
+                        print(f"    Warning: Could not open video: {video_path}")
+                        continue
+                    
+                    fps = int(cap.get(cv2.CAP_PROP_FPS))
+                    total_video_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                    print(f"    Video: {total_video_frames} frames @ {fps} FPS")
+                    
+                    frame_count = 0
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        
+                        frames_to_process.append(frame)
+                        frame_count += 1
+                        
+                        if max_frames and len(frames_to_process) >= max_frames:
+                            break
+                    
+                    cap.release()
+                    print(f"    Loaded {frame_count} frames from {video_path.name}")
+                    
+                    if max_frames and len(frames_to_process) >= max_frames:
+                        break
+                
+                if not frames_to_process:
+                    raise ValueError(f"Could not read any frames from videos in: {source_path}")
+            else:
+                # Load images
+                if max_frames:
+                    files_to_process = files_to_process[:max_frames]
+                
+                print(f"Loading {len(files_to_process)} images...")
+                for img_path in files_to_process:
+                    frame = cv2.imread(str(img_path))
+                    if frame is not None:
+                        frames_to_process.append(frame)
+                
+                if not frames_to_process:
+                    raise ValueError(f"Could not load any images from: {source_path}")
         
         elif source_path.suffix.lower() in video_extensions:
             # Load frames from video
