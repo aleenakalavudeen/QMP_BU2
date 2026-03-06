@@ -51,10 +51,11 @@ from sign_module import SignDetector
 from signal_module import SignalDetector
 from road_module import RoadAnomalyDetector
 from risk_congestion_module import RiskCongestionDetector, draw_text_with_bg
+from lane_module import LaneDetector
 
 
 
-VALID_MODELS = ['sign', 'signal', 'anomaly', 'risk_congestion']
+VALID_MODELS = ['sign', 'signal', 'anomaly', 'risk_congestion', 'lane']
 
 
 class IntegratedTrafficPerception:
@@ -119,14 +120,27 @@ class IntegratedTrafficPerception:
         
         # Load risk & congestion model if enabled
         if 'risk_congestion' in self.selected_models:
-            print("\n[4/4] Loading risk & congestion detection model...")
+            print("\n[4/5] Loading risk & congestion detection model...")
             # FPS will be set later when processing video
             self.risk_congestion_detector = RiskCongestionDetector(device=self.device)
             self.risk_congestion_fps = None  # Will be set during video processing
         else:
-            print("\n[4/4] Skipping risk & congestion detection model (disabled)")
+            print("\n[4/5] Skipping risk & congestion detection model (disabled)")
             self.risk_congestion_detector = None
             self.risk_congestion_fps = None
+        
+        # Load lane detection model if enabled
+        if 'lane' in self.selected_models:
+            print("\n[5/5] Loading lane detection model...")
+            try:
+                self.lane_detector = LaneDetector(device=self.device)
+            except Exception as e:
+                print(f"  ⚠ Warning: Failed to load lane detection model: {e}")
+                print("  Continuing without lane detection...")
+                self.lane_detector = None
+        else:
+            print("\n[5/5] Skipping lane detection model (disabled)")
+            self.lane_detector = None
         
         print("\n" + "=" * 70)
         print("All models loaded successfully! ✓")
@@ -138,6 +152,7 @@ class IntegratedTrafficPerception:
             'traffic_signal': (0, 0, 255),    # Red
             'road_anomaly': (255, 0, 0),      # Blue
             'risk_congestion': (255, 165, 0), # Orange
+            'lane_detection': (255, 255, 0),  # Yellow
         }
         
         # Thread-safe detection methods using ThreadingLocked decorator
@@ -147,26 +162,30 @@ class IntegratedTrafficPerception:
             self._detect_signal_threadsafe = ThreadingLocked()(self._detect_signal_impl)
             self._detect_anomaly_threadsafe = ThreadingLocked()(self._detect_anomaly_impl)
             self._detect_risk_congestion_threadsafe = ThreadingLocked()(self._detect_risk_congestion_impl)
+            self._detect_lane_threadsafe = ThreadingLocked()(self._detect_lane_impl)
         else:
             # If ThreadingLocked not available, use locks manually
             self._sign_lock = threading.Lock()
             self._signal_lock = threading.Lock()
             self._anomaly_lock = threading.Lock()
             self._risk_congestion_lock = threading.Lock()
+            self._lane_lock = threading.Lock()
             self._detect_sign_threadsafe = self._detect_sign_with_lock
             self._detect_signal_threadsafe = self._detect_signal_with_lock
             self._detect_anomaly_threadsafe = self._detect_anomaly_with_lock
             self._detect_risk_congestion_threadsafe = self._detect_risk_congestion_with_lock
+            self._detect_lane_threadsafe = self._detect_lane_with_lock
         
         # Initialize tracking for individual model outputs
         self._init_output_tracking()
         
         # Create separate thread pools for each model (1 thread each for sequential mode)
-        # This ensures fair comparison: same total thread capacity (4 threads) as parallel mode
+        # This ensures fair comparison: same total thread capacity (5 threads) as parallel mode
         self.sign_executor = ThreadPoolExecutor(max_workers=1) if self.sign_detector else None
         self.signal_executor = ThreadPoolExecutor(max_workers=1) if self.signal_detector else None
         self.anomaly_executor = ThreadPoolExecutor(max_workers=1) if self.road_detector else None
         self.risk_congestion_executor = ThreadPoolExecutor(max_workers=1) if self.risk_congestion_detector else None
+        self.lane_executor = ThreadPoolExecutor(max_workers=1) if self.lane_detector else None
     
     def _detect_sign_impl(self, frame: np.ndarray) -> List[Dict]:
         """Internal implementation for sign detection."""
@@ -199,6 +218,12 @@ class IntegratedTrafficPerception:
             return self.risk_congestion_detector.detect(frame, frame_id=frame_id)
         return {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
     
+    def _detect_lane_impl(self, frame: np.ndarray, conf_threshold: float = 0.3) -> Dict:
+        """Internal implementation for lane detection."""
+        if self.lane_detector:
+            return self.lane_detector.detect(frame, conf_threshold=conf_threshold)
+        return {'detections': [], 'drivable_area_mask': None, 'lane_line_mask': None}
+    
     def _detect_sign_with_lock(self, frame: np.ndarray) -> List[Dict]:
         """Thread-safe sign detection using manual lock."""
         with self._sign_lock:
@@ -219,6 +244,11 @@ class IntegratedTrafficPerception:
         with self._risk_congestion_lock:
             return self._detect_risk_congestion_impl(frame, frame_id=frame_id)
     
+    def _detect_lane_with_lock(self, frame: np.ndarray, conf_threshold: float = 0.3) -> Dict:
+        """Thread-safe lane detection using manual lock."""
+        with self._lane_lock:
+            return self._detect_lane_impl(frame, conf_threshold=conf_threshold)
+    
     def _init_output_tracking(self):
         """Initialize tracking structures for individual model outputs."""
         # Signal detection tracking
@@ -234,6 +264,9 @@ class IntegratedTrafficPerception:
         self.risk_congestion_detections_by_class = {}  # class_name -> count
         self.risk_metrics_history = []  # Store risk metrics over time
         self.congestion_metrics_history = []  # Store congestion metrics over time
+        
+        # Lane detection tracking
+        self.lane_detections_by_class = {}  # class_name -> count
     
     def cleanup(self):
         """Shutdown all thread pools."""
@@ -245,6 +278,8 @@ class IntegratedTrafficPerception:
             self.anomaly_executor.shutdown(wait=True)
         if hasattr(self, 'risk_congestion_executor') and self.risk_congestion_executor:
             self.risk_congestion_executor.shutdown(wait=True)
+        if hasattr(self, 'lane_executor') and self.lane_executor:
+            self.lane_executor.shutdown(wait=True)
         
     
     def process_frame(self, frame: np.ndarray, use_parallel: bool = None, conf_threshold: float = 0.25, frame_id: Optional[int] = None) -> Dict:
@@ -283,7 +318,8 @@ class IntegratedTrafficPerception:
             'sign_model': 0.0,
             'signal_model': 0.0,
             'anomaly_model': 0.0,
-            'risk_congestion_model': 0.0
+            'risk_congestion_model': 0.0,
+            'lane_model': 0.0
         }
         
         # Step 1: Run enabled models (in parallel if requested)
@@ -293,6 +329,7 @@ class IntegratedTrafficPerception:
             signal_detections = []
             anomaly_detections = []
             risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
+            lane_results = {'detections': [], 'drivable_area_mask': None, 'lane_line_mask': None}
             
             # Create a copy of the frame for each thread (to avoid potential issues)
             frame_copy = frame.copy()
@@ -302,6 +339,8 @@ class IntegratedTrafficPerception:
                 start = time.time()
                 if conf_thresh is not None and model_name == 'signal':
                     result = detector_func(frame_copy, conf_threshold=conf_thresh)
+                elif conf_thresh is not None and model_name == 'lane':
+                    result = detector_func(frame_copy, conf_threshold=conf_thresh)
                 elif model_name == 'risk_congestion':
                     result = detector_func(frame_copy, frame_id=frame_id)
                 else:
@@ -310,7 +349,7 @@ class IntegratedTrafficPerception:
                 return result, elapsed, model_name
             
             # Submit all detection tasks to thread pool
-            with ThreadPoolExecutor(max_workers=4) as executor:
+            with ThreadPoolExecutor(max_workers=5) as executor:
                 futures = {}
                 
                 if self.sign_detector:
@@ -321,6 +360,8 @@ class IntegratedTrafficPerception:
                     futures['anomaly'] = executor.submit(timed_detect, self._detect_anomaly_threadsafe, frame_copy, 'anomaly')
                 if self.risk_congestion_detector:
                     futures['risk_congestion'] = executor.submit(timed_detect, self._detect_risk_congestion_threadsafe, frame_copy, 'risk_congestion', frame_id=frame_id)
+                if self.lane_detector:
+                    futures['lane'] = executor.submit(timed_detect, self._detect_lane_threadsafe, frame_copy, 'lane', conf_thresh=conf_threshold)
                 
                 # Collect results as they complete and track timing
                 for model_name, future in futures.items():
@@ -338,6 +379,9 @@ class IntegratedTrafficPerception:
                         elif model_name == 'risk_congestion':
                             risk_congestion_results = result
                             model_times['risk_congestion_model'] = elapsed_time
+                        elif model_name == 'lane':
+                            lane_results = result
+                            model_times['lane_model'] = elapsed_time
                     except Exception as e:
                         print(f"Warning: Error in {model_name} detection: {e}")
                         if model_name == 'sign':
@@ -348,6 +392,8 @@ class IntegratedTrafficPerception:
                             anomaly_detections = []
                         elif model_name == 'risk_congestion':
                             risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
+                        elif model_name == 'lane':
+                            lane_results = {'detections': [], 'drivable_area_mask': None, 'lane_line_mask': None}
         else:
             # Sequential processing (models run one after another, each model uses 1 thread)
             # Total thread capacity: 4 threads (1 per model), same as parallel mode for fair comparison
@@ -402,34 +448,96 @@ class IntegratedTrafficPerception:
                 model_times['risk_congestion_model'] = time.time() - risk_congestion_start
             else:
                 risk_congestion_results = {'detections': [], 'risk_metrics': None, 'congestion_metrics': None}
+            
+            if self.lane_detector:
+                lane_start = time.time()
+                try:
+                    # Use lane model's 1-thread pool
+                    future = self.lane_executor.submit(self._detect_lane_threadsafe, frame, conf_threshold)
+                    lane_results = future.result()
+                except Exception as e:
+                    print(f"Warning: Error in lane detection: {e}")
+                    lane_results = {'detections': [], 'drivable_area_mask': None, 'lane_line_mask': None}
+                model_times['lane_model'] = time.time() - lane_start
+            else:
+                lane_results = {'detections': [], 'drivable_area_mask': None, 'lane_line_mask': None}
         
         # Extract risk_congestion detections
         risk_congestion_detections = risk_congestion_results.get('detections', [])
         risk_metrics = risk_congestion_results.get('risk_metrics', None)
         congestion_metrics = risk_congestion_results.get('congestion_metrics', None)
         
+        # Extract lane detection results
+        lane_detections = lane_results.get('detections', [])
+        drivable_area_mask = lane_results.get('drivable_area_mask', None)
+        lane_line_mask = lane_results.get('lane_line_mask', None)
+        
+        # Create detection entries for segmentation masks
+        # These will appear in CSV with special class names
+        if drivable_area_mask is not None:
+            # Calculate mask statistics
+            mask_area = np.sum(drivable_area_mask == 1)
+            total_pixels = drivable_area_mask.shape[0] * drivable_area_mask.shape[1]
+            coverage_percentage = (mask_area / total_pixels) * 100 if total_pixels > 0 else 0
+            
+            # Create bounding box that covers the entire mask area
+            h, w = drivable_area_mask.shape
+            mask_detection = {
+                'model_type': 'lane_detection',
+                'class_name': 'drivable_area',  # Special class name for segmentation mask
+                'confidence': 1.0,  # Segmentation masks don't have confidence, use 1.0
+                'bbox': (0, 0, w, h),  # Full frame bbox for mask
+                'mask': drivable_area_mask,  # Store mask reference
+                'mask_area': mask_area,
+                'coverage_percentage': coverage_percentage
+            }
+            lane_detections.append(mask_detection)
+        
+        if lane_line_mask is not None:
+            # Calculate mask statistics
+            mask_area = np.sum(lane_line_mask == 1)
+            total_pixels = lane_line_mask.shape[0] * lane_line_mask.shape[1]
+            coverage_percentage = (mask_area / total_pixels) * 100 if total_pixels > 0 else 0
+            
+            # Create bounding box that covers the entire mask area
+            h, w = lane_line_mask.shape
+            mask_detection = {
+                'model_type': 'lane_detection',
+                'class_name': 'lane_line',  # Special class name for segmentation mask
+                'confidence': 1.0,  # Segmentation masks don't have confidence, use 1.0
+                'bbox': (0, 0, w, h),  # Full frame bbox for mask
+                'mask': lane_line_mask,  # Store mask reference
+                'mask_area': mask_area,
+                'coverage_percentage': coverage_percentage
+            }
+            lane_detections.append(mask_detection)
+        
         # Step 2: Combine all detections into a single list
-        all_detections = sign_detections + signal_detections + anomaly_detections + risk_congestion_detections
+        all_detections = sign_detections + signal_detections + anomaly_detections + risk_congestion_detections + lane_detections
         
         # Step 3: Create confidence summaries
         sign_confidences = [det['confidence'] for det in sign_detections]
         signal_confidences = [det['confidence'] for det in signal_detections]
         anomaly_confidences = [det['confidence'] for det in anomaly_detections]
         risk_congestion_confidences = [det['confidence'] for det in risk_congestion_detections]
+        lane_confidences = [det['confidence'] for det in lane_detections]
         
         confidence_summaries = {
             'sign_model': sign_confidences,
             'signal_model': signal_confidences,
             'anomaly_model': anomaly_confidences,
-            'risk_congestion_model': risk_congestion_confidences
+            'risk_congestion_model': risk_congestion_confidences,
+            'lane_model': lane_confidences
         }
         
-        # Step 4: Create annotated frame (with risk/PCU overlays if available)
+        # Step 4: Create annotated frame (with risk/PCU overlays and segmentation masks if available)
         annotated_frame = self._draw_annotations(
             frame.copy(), 
             all_detections,
             risk_metrics=risk_metrics,
-            congestion_metrics=congestion_metrics
+            congestion_metrics=congestion_metrics,
+            drivable_area_mask=drivable_area_mask,
+            lane_line_mask=lane_line_mask
         )
         
         # Step 5: Calculate processing time
@@ -449,9 +557,13 @@ class IntegratedTrafficPerception:
             'signal_detections': signal_detections,
             'anomaly_detections': anomaly_detections,
             'risk_congestion_detections': risk_congestion_detections,
+            'lane_detections': lane_detections,
             # Risk and congestion metrics
             'risk_metrics': risk_metrics,
-            'congestion_metrics': congestion_metrics
+            'congestion_metrics': congestion_metrics,
+            # Lane detection segmentation masks
+            'drivable_area_mask': drivable_area_mask,
+            'lane_line_mask': lane_line_mask
         }
         
         return results
@@ -701,6 +813,13 @@ class IntegratedTrafficPerception:
         print(f"  Total Time Reduction:              {time_reduction_total:.4f}s")
         print(f"  Percentage Reduction (Total):      {percentage_reduction_total:.2f}%")
         print()
+        # Calculate and print FPS
+        parallel_fps = total_frames / parallel_total_time if parallel_total_time > 0 else 0
+        sequential_fps = total_frames / sequential_total_time if sequential_total_time > 0 else 0
+        print("FPS METRICS:")
+        print(f"  Parallel FPS:                      {parallel_fps:.2f}")
+        print(f"  Sequential FPS:                    {sequential_fps:.2f}")
+        print()
         print("PER-FRAME METRICS:")
         print(f"  Parallel Avg Time/Frame:           {parallel_avg_frame_time:.4f}s")
         print(f"  Sequential Avg Time/Frame:         {sequential_avg_frame_time:.4f}s")
@@ -723,6 +842,8 @@ class IntegratedTrafficPerception:
             'frames_processed': total_frames,
             'parallel_avg_frame_time': parallel_avg_frame_time,
             'sequential_avg_frame_time': sequential_avg_frame_time,
+            'parallel_fps': parallel_fps,
+            'sequential_fps': sequential_fps,
             'parallel_frame_times': parallel_frame_times,
             'sequential_frame_times': sequential_frame_times,
             'source': str(source_path)
@@ -753,6 +874,8 @@ class IntegratedTrafficPerception:
                 'Per-Frame Time Reduction (s)': f"{benchmark_results.get('time_reduction_per_frame', 0.0):.6f}",
                 'Percentage Reduction Per-Frame (%)': f"{benchmark_results.get('percentage_reduction_per_frame', 0.0):.2f}",
                 'Speedup Factor (x)': f"{benchmark_results.get('speedup_factor', 1.0):.2f}",
+                'Parallel FPS': f"{benchmark_results.get('parallel_fps', 0.0):.2f}",
+                'Sequential FPS': f"{benchmark_results.get('sequential_fps', 0.0):.2f}",
                 'Timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
             }
             
@@ -761,7 +884,7 @@ class IntegratedTrafficPerception:
                 'Source', 'Frames Processed',
                 'Parallel Total Time (s)', 'Sequential Total Time (s)', 'Total Time Reduction (s)', 'Percentage Reduction Total (%)',
                 'Parallel Avg Time Per Frame (s)', 'Sequential Avg Time Per Frame (s)', 'Per-Frame Time Reduction (s)', 'Percentage Reduction Per-Frame (%)',
-                'Speedup Factor (x)', 'Timestamp'
+                'Speedup Factor (x)', 'Parallel FPS', 'Sequential FPS', 'Timestamp'
             ]
             
             file_exists = output_path.is_file()
@@ -804,6 +927,16 @@ class IntegratedTrafficPerception:
             csv_data = []
             for det in detections:
                 x1, y1, x2, y2 = det.get('bbox', (0, 0, 0, 0))
+                
+                # Get mask metadata if available
+                mask_area = det.get('mask_area', '')
+                coverage_percentage = det.get('coverage_percentage', '')
+                has_mask = 'Yes' if det.get('mask') is not None else 'No'
+                
+                # Format mask metadata for CSV
+                mask_area_str = str(int(mask_area)) if mask_area != '' else ''
+                coverage_str = f"{coverage_percentage:.2f}" if coverage_percentage != '' and isinstance(coverage_percentage, (int, float)) else ''
+                
                 row = {
                     'Source': source_name,
                     'Frame': frame_number if frame_number is not None else '',
@@ -813,13 +946,17 @@ class IntegratedTrafficPerception:
                     'Bbox X1': int(x1),
                     'Bbox Y1': int(y1),
                     'Bbox X2': int(x2),
-                    'Bbox Y2': int(y2)
+                    'Bbox Y2': int(y2),
+                    'Mask Area': mask_area_str,
+                    'Coverage Percentage': coverage_str,
+                    'Has Mask': has_mask
                 }
                 csv_data.append(row)
             
             # Write to CSV
             fieldnames = ['Source', 'Frame', 'Model Type', 'Class Name', 'Confidence', 
-                         'Bbox X1', 'Bbox Y1', 'Bbox X2', 'Bbox Y2']
+                         'Bbox X1', 'Bbox Y1', 'Bbox X2', 'Bbox Y2',
+                         'Mask Area', 'Coverage Percentage', 'Has Mask']
             file_exists = output_path.is_file() and append
             
             mode = 'a' if append else 'w'
@@ -836,7 +973,7 @@ class IntegratedTrafficPerception:
     
     def _print_individual_model_outputs(self, signal_detections_by_class, sign_detections_by_class, 
                                        anomaly_detections_by_class, risk_congestion_detections_by_class,
-                                       frame_count):
+                                       lane_detections_by_class, frame_count):
         """
         Print test outputs from individual models, similar to their standalone test outputs.
         
@@ -845,6 +982,7 @@ class IntegratedTrafficPerception:
             sign_detections_by_class: Dict of class_name -> count for sign detections
             anomaly_detections_by_class: Dict of class_name -> count for anomaly detections
             risk_congestion_detections_by_class: Dict of class_name -> count for risk_congestion detections
+            lane_detections_by_class: Dict of class_name -> count for lane detections
             frame_count: Total number of frames processed
         """
         print(f"\n{'='*70}")
@@ -909,11 +1047,27 @@ class IntegratedTrafficPerception:
                 print(f"  {'No detections':<20} {'0':<10}")
             print(f"  Format: Similar to driving_risk_and_congestion/src/demoidd_riskest_cong.py output")
         
+        # Lane Detection Model Outputs
+        if lane_detections_by_class or 'lane' in self.selected_models:
+            print(f"\n[5] LANE DETECTION MODEL OUTPUTS (from lane_det):")
+            print(f"  {'Class':<20} {'Count':<10}")
+            print(f"  {'-'*20} {'-'*10}")
+            if lane_detections_by_class:
+                total_lane = sum(lane_detections_by_class.values())
+                for class_name, count in sorted(lane_detections_by_class.items()):
+                    print(f"  {class_name:<20} {count:<10}")
+                print(f"  {'TOTAL':<20} {total_lane:<10}")
+            else:
+                print(f"  {'No detections':<20} {'0':<10}")
+            print(f"  Format: Similar to lane_det output")
+        
         print(f"\n{'='*70}")
     
     def _draw_annotations(self, frame: np.ndarray, detections: List[Dict], 
                          risk_metrics: Optional[Dict] = None, 
-                         congestion_metrics: Optional[Dict] = None) -> np.ndarray:
+                         congestion_metrics: Optional[Dict] = None,
+                         drivable_area_mask: Optional[np.ndarray] = None,
+                         lane_line_mask: Optional[np.ndarray] = None) -> np.ndarray:
         """
         Draw bounding boxes and labels on the frame.
         Also overlays risk labels and PCU values if available (matching original model).
@@ -1027,6 +1181,31 @@ class IntegratedTrafficPerception:
                     thickness=3,
                     padding=12
                 )
+        
+        # Add lane detection segmentation overlays if available
+        if drivable_area_mask is not None or lane_line_mask is not None:
+            # Create overlay for segmentation masks
+            overlay = annotated.copy()
+            
+            # Draw drivable area mask (green)
+            if drivable_area_mask is not None:
+                da_mask_binary = (drivable_area_mask == 1).astype(np.uint8)
+                overlay[da_mask_binary > 0] = overlay[da_mask_binary > 0] * 0.5 + np.array([0, 255, 0]) * 0.5
+            
+            # Draw lane line mask (red)
+            if lane_line_mask is not None:
+                ll_mask_binary = (lane_line_mask == 1).astype(np.uint8)
+                overlay[ll_mask_binary > 0] = overlay[ll_mask_binary > 0] * 0.5 + np.array([0, 0, 255]) * 0.5
+            
+            # Blend overlay with original
+            mask_combined = np.zeros(annotated.shape[:2], dtype=np.uint8)
+            if drivable_area_mask is not None:
+                mask_combined = np.maximum(mask_combined, (drivable_area_mask == 1).astype(np.uint8))
+            if lane_line_mask is not None:
+                mask_combined = np.maximum(mask_combined, (lane_line_mask == 1).astype(np.uint8))
+            
+            if mask_combined.sum() > 0:
+                annotated[mask_combined > 0] = overlay[mask_combined > 0]
         
         return annotated
     
@@ -1240,6 +1419,7 @@ class IntegratedTrafficPerception:
         print(f"  Sign Model - Average time per frame: {model_times.get('sign_model', 0.0):.4f} seconds ({model_times.get('sign_model', 0.0)*1000:.2f} ms)")
         print(f"  Signal Model - Average time per frame: {model_times.get('signal_model', 0.0):.4f} seconds ({model_times.get('signal_model', 0.0)*1000:.2f} ms)")
         print(f"  Anomaly Model - Average time per frame: {model_times.get('anomaly_model', 0.0):.4f} seconds ({model_times.get('anomaly_model', 0.0)*1000:.2f} ms)")
+        print(f"  Lane Model - Average time per frame: {model_times.get('lane_model', 0.0):.4f} seconds ({model_times.get('lane_model', 0.0)*1000:.2f} ms)")
         if 'risk_congestion_model' in model_times:
             print(f"  Risk & Congestion Model - Average time per frame: {model_times.get('risk_congestion_model', 0.0):.4f} seconds ({model_times.get('risk_congestion_model', 0.0)*1000:.2f} ms)")
         
@@ -1271,6 +1451,7 @@ class IntegratedTrafficPerception:
         sign_detections_by_class = {}
         anomaly_detections_by_class = {}
         risk_congestion_detections_by_class = {}
+        lane_detections_by_class = {}
         
         for det in results['detections']:
             model_type = det.get('model_type', 'unknown')
@@ -1284,12 +1465,15 @@ class IntegratedTrafficPerception:
                 anomaly_detections_by_class[class_name] = anomaly_detections_by_class.get(class_name, 0) + 1
             elif model_type == 'risk_congestion':
                 risk_congestion_detections_by_class[class_name] = risk_congestion_detections_by_class.get(class_name, 0) + 1
+            elif model_type == 'lane_detection':
+                lane_detections_by_class[class_name] = lane_detections_by_class.get(class_name, 0) + 1
         
         self._print_individual_model_outputs(
             signal_detections_by_class,
             sign_detections_by_class,
             anomaly_detections_by_class,
             risk_congestion_detections_by_class,
+            lane_detections_by_class,
             1
         )
         
@@ -1420,13 +1604,15 @@ class IntegratedTrafficPerception:
             'traffic_sign': 0,
             'traffic_signal': 0,
             'road_anomaly': 0,
-            'risk_congestion': 0
+            'risk_congestion': 0,
+            'lane_detection': 0
         }
         confidence_scores = {
             'traffic_sign': [],
             'traffic_signal': [],
             'road_anomaly': [],
-            'risk_congestion': []
+            'risk_congestion': [],
+            'lane_detection': []
         }
         class_counts = {}  # Track counts per class name
         
@@ -1435,6 +1621,7 @@ class IntegratedTrafficPerception:
         sign_detections_by_class = {}  # class_name -> count
         anomaly_detections_by_class = {}  # class_name -> count
         risk_congestion_detections_by_class = {}  # class_name -> count
+        lane_detections_by_class = {}  # class_name -> count
         all_detections_for_csv = []  # List of all detections for CSV output
         
         # Track risk and congestion metrics for original format CSV (matching demoidd_video_riskest_cong.py)
@@ -1496,6 +1683,11 @@ class IntegratedTrafficPerception:
                     if class_name not in risk_congestion_detections_by_class:
                         risk_congestion_detections_by_class[class_name] = 0
                     risk_congestion_detections_by_class[class_name] += 1
+                
+                elif model_type == 'lane_detection':
+                    if class_name not in lane_detections_by_class:
+                        lane_detections_by_class[class_name] = 0
+                    lane_detections_by_class[class_name] += 1
                 
                 # Collect all detections for CSV output
                 video_name = Path(video_path).stem
@@ -1677,7 +1869,8 @@ class IntegratedTrafficPerception:
         avg_model_times = {
             'sign_model': 0.0,
             'signal_model': 0.0,
-            'anomaly_model': 0.0
+            'anomaly_model': 0.0,
+            'lane_model': 0.0
         }
         if model_times_list:
             for model_name in avg_model_times.keys():
@@ -1871,6 +2064,7 @@ class IntegratedTrafficPerception:
         print(f"  Sign Model - Average time per frame: {avg_model_times['sign_model']:.4f} seconds ({avg_model_times['sign_model']*1000:.2f} ms)")
         print(f"  Signal Model - Average time per frame: {avg_model_times['signal_model']:.4f} seconds ({avg_model_times['signal_model']*1000:.2f} ms)")
         print(f"  Anomaly Model - Average time per frame: {avg_model_times['anomaly_model']:.4f} seconds ({avg_model_times['anomaly_model']*1000:.2f} ms)")
+        print(f"  Lane Model - Average time per frame: {avg_model_times['lane_model']:.4f} seconds ({avg_model_times['lane_model']*1000:.2f} ms)")
         if 'risk_congestion_model' in avg_model_times:
             print(f"  Risk & Congestion Model - Average time per frame: {avg_model_times['risk_congestion_model']:.4f} seconds ({avg_model_times['risk_congestion_model']*1000:.2f} ms)")
         # Performance metrics are suppressed here - they will be aggregated and printed
@@ -1887,6 +2081,7 @@ class IntegratedTrafficPerception:
             sign_detections_by_class,
             anomaly_detections_by_class,
             risk_congestion_detections_by_class,
+            lane_detections_by_class,
             frame_count
         )
         
@@ -1917,6 +2112,15 @@ class IntegratedTrafficPerception:
                     frame_time = frame_times[frame_idx] if frame_idx < len(frame_times) and frame_idx >= 0 else 0.0
                     model_times = model_times_list[frame_idx] if frame_idx < len(model_times_list) and frame_idx >= 0 else {}
                     
+                    # Get mask metadata if available
+                    mask_area = det.get('mask_area', '')
+                    coverage_percentage = det.get('coverage_percentage', '')
+                    has_mask = 'Yes' if det.get('mask') is not None else 'No'
+                    
+                    # Format mask metadata for CSV
+                    mask_area_str = str(int(mask_area)) if mask_area != '' else ''
+                    coverage_str = f"{coverage_percentage:.2f}" if coverage_percentage != '' and isinstance(coverage_percentage, (int, float)) else ''
+                    
                     row = {
                         'Source': item['source_name'],
                         'Frame': item['frame_number'],
@@ -1925,6 +2129,7 @@ class IntegratedTrafficPerception:
                         'Sign Model Time (ms)': f"{model_times.get('sign_model', 0.0) * 1000:.3f}",
                         'Signal Model Time (ms)': f"{model_times.get('signal_model', 0.0) * 1000:.3f}",
                         'Anomaly Model Time (ms)': f"{model_times.get('anomaly_model', 0.0) * 1000:.3f}",
+                        'Lane Model Time (ms)': f"{model_times.get('lane_model', 0.0) * 1000:.3f}",
                         'Risk Congestion Model Time (ms)': f"{model_times.get('risk_congestion_model', 0.0) * 1000:.3f}",
                         'Model Type': det.get('model_type', 'unknown'),
                         'Class Name': det.get('class_name', 'unknown'),
@@ -1932,16 +2137,21 @@ class IntegratedTrafficPerception:
                         'Bbox X1': int(x1),
                         'Bbox Y1': int(y1),
                         'Bbox X2': int(x2),
-                        'Bbox Y2': int(y2)
+                        'Bbox Y2': int(y2),
+                        'Mask Area': mask_area_str,
+                        'Coverage Percentage': coverage_str,
+                        'Has Mask': has_mask
                     }
                     csv_data.append(row)
                 
                 # Write to CSV
                 fieldnames = ['Source', 'Frame', 'Processing Time (s)', 'Processing Time (ms)',
                              'Sign Model Time (ms)', 'Signal Model Time (ms)',
-                             'Anomaly Model Time (ms)', 'Risk Congestion Model Time (ms)',
+                             'Anomaly Model Time (ms)', 'Lane Model Time (ms)',
+                             'Risk Congestion Model Time (ms)',
                              'Model Type', 'Class Name', 'Confidence', 
-                             'Bbox X1', 'Bbox Y1', 'Bbox X2', 'Bbox Y2']
+                             'Bbox X1', 'Bbox Y1', 'Bbox X2', 'Bbox Y2',
+                             'Mask Area', 'Coverage Percentage', 'Has Mask']
                 
                 # Use append mode if file exists (for directory processing), write mode otherwise
                 mode = 'a' if csv_exists else 'w'
@@ -2002,6 +2212,7 @@ class IntegratedTrafficPerception:
                 print(f"    - Traffic Signs: {sum(1 for item in all_detections_for_csv if item['detection']['model_type'] == 'traffic_sign')}")
                 print(f"    - Traffic Signals: {sum(1 for item in all_detections_for_csv if item['detection']['model_type'] == 'traffic_signal')}")
                 print(f"    - Road Anomalies: {sum(1 for item in all_detections_for_csv if item['detection']['model_type'] == 'road_anomaly')}")
+                print(f"    - Lane Detections: {sum(1 for item in all_detections_for_csv if item['detection']['model_type'] == 'lane_detection')}")
                 print(f"{'='*70}")
             except Exception as e:
                 print(f"\nWarning: Failed to save detections CSV file: {e}")
@@ -2287,6 +2498,7 @@ class IntegratedTrafficPerception:
                 'sign_model': 0.0,
                 'signal_model': 0.0,
                 'anomaly_model': 0.0,
+                'lane_model': 0.0,
                 'risk_congestion_model': 0.0
             }
             
@@ -2295,6 +2507,7 @@ class IntegratedTrafficPerception:
                 'sign_model': [],
                 'signal_model': [],
                 'anomaly_model': [],
+                'lane_model': [],
                 'risk_congestion_model': []
             }
             
@@ -2318,6 +2531,7 @@ class IntegratedTrafficPerception:
             print(f"  Sign Model - Average time per frame: {overall_avg_model_times['sign_model']:.4f} seconds ({overall_avg_model_times['sign_model']*1000:.2f} ms)")
             print(f"  Signal Model - Average time per frame: {overall_avg_model_times['signal_model']:.4f} seconds ({overall_avg_model_times['signal_model']*1000:.2f} ms)")
             print(f"  Anomaly Model - Average time per frame: {overall_avg_model_times['anomaly_model']:.4f} seconds ({overall_avg_model_times['anomaly_model']*1000:.2f} ms)")
+            print(f"  Lane Model - Average time per frame: {overall_avg_model_times['lane_model']:.4f} seconds ({overall_avg_model_times['lane_model']*1000:.2f} ms)")
             if overall_avg_model_times.get('risk_congestion_model', 0.0) > 0:
                 print(f"  Risk & Congestion Model - Average time per frame: {overall_avg_model_times['risk_congestion_model']:.4f} seconds ({overall_avg_model_times['risk_congestion_model']*1000:.2f} ms)")
             
@@ -2339,6 +2553,8 @@ class IntegratedTrafficPerception:
                 'signal_model_avg_time_per_frame_ms': overall_avg_model_times['signal_model'] * 1000,
                 'anomaly_model_avg_time_per_frame_seconds': overall_avg_model_times['anomaly_model'],
                 'anomaly_model_avg_time_per_frame_ms': overall_avg_model_times['anomaly_model'] * 1000,
+                'lane_model_avg_time_per_frame_seconds': overall_avg_model_times['lane_model'],
+                'lane_model_avg_time_per_frame_ms': overall_avg_model_times['lane_model'] * 1000,
                 'risk_congestion_model_avg_time_per_frame_seconds': overall_avg_model_times.get('risk_congestion_model', 0.0),
                 'risk_congestion_model_avg_time_per_frame_ms': overall_avg_model_times.get('risk_congestion_model', 0.0) * 1000
             }
@@ -2367,6 +2583,8 @@ class IntegratedTrafficPerception:
                         'Signal_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['signal_model_avg_time_per_frame_ms']:.2f}",
                         'Anomaly_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['anomaly_model_avg_time_per_frame_seconds']:.4f}",
                         'Anomaly_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['anomaly_model_avg_time_per_frame_ms']:.2f}",
+                        'Lane_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['lane_model_avg_time_per_frame_seconds']:.4f}",
+                        'Lane_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['lane_model_avg_time_per_frame_ms']:.2f}",
                         'Risk_Congestion_Model_Avg_Time_Per_Frame_Seconds': f"{overall_timing_data['risk_congestion_model_avg_time_per_frame_seconds']:.4f}",
                         'Risk_Congestion_Model_Avg_Time_Per_Frame_Ms': f"{overall_timing_data['risk_congestion_model_avg_time_per_frame_ms']:.2f}"
                     }
@@ -2394,6 +2612,8 @@ class IntegratedTrafficPerception:
                         'Signal_Model_Avg_Time_Per_Frame_Ms': '',
                         'Anomaly_Model_Avg_Time_Per_Frame_Seconds': '',
                         'Anomaly_Model_Avg_Time_Per_Frame_Ms': '',
+                        'Lane_Model_Avg_Time_Per_Frame_Seconds': '',
+                        'Lane_Model_Avg_Time_Per_Frame_Ms': '',
                         'Risk_Congestion_Model_Avg_Time_Per_Frame_Seconds': '',
                         'Risk_Congestion_Model_Avg_Time_Per_Frame_Ms': ''
                     }
@@ -2787,7 +3007,8 @@ class IntegratedTrafficPerception:
         avg_model_times = {
             'sign_model': 0.0,
             'signal_model': 0.0,
-            'anomaly_model': 0.0
+            'anomaly_model': 0.0,
+            'lane_model': 0.0
         }
         if model_times_list:
             for model_name in avg_model_times.keys():
@@ -2807,6 +3028,7 @@ class IntegratedTrafficPerception:
         print(f"  Sign Model - Average time per frame: {avg_model_times['sign_model']:.4f} seconds ({avg_model_times['sign_model']*1000:.2f} ms)")
         print(f"  Signal Model - Average time per frame: {avg_model_times['signal_model']:.4f} seconds ({avg_model_times['signal_model']*1000:.2f} ms)")
         print(f"  Anomaly Model - Average time per frame: {avg_model_times['anomaly_model']:.4f} seconds ({avg_model_times['anomaly_model']*1000:.2f} ms)")
+        print(f"  Lane Model - Average time per frame: {avg_model_times['lane_model']:.4f} seconds ({avg_model_times['lane_model']*1000:.2f} ms)")
         if 'risk_congestion_model' in avg_model_times:
             print(f"  Risk & Congestion Model - Average time per frame: {avg_model_times['risk_congestion_model']:.4f} seconds ({avg_model_times['risk_congestion_model']*1000:.2f} ms)")
         
